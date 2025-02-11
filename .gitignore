@@ -1,0 +1,37 @@
+# Byte-compiled files
+*.pyc
+*.pyo
+__pycache__/
+
+# Virtual environment
+venv/
+
+# Pytest cache
+.pytest_cache/
+.coverage
+
+# Coverage files
+.coverage
+*.cover
+
+# Egg metadata
+*.egg-info/
+
+# Temporary or backup files
+*.log
+*.tmp
+*.swp
+*.bak
+*.orig
+
+# Files created by editors/IDEs
+*.vscode/
+.idea/
+.DS_Store
+
+# System-specific files
+Thumbs.db
+
+python_files_inventory.txt
+
+*sqlite3
