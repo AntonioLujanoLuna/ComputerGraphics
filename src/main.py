@@ -9,7 +9,8 @@ from geometry.sphere import Sphere
 from geometry.mesh import TriangleMesh, load_obj
 from materials.lambertian import Lambertian
 from materials.metal import Metal
-from renderer.raytracer import Renderer
+from materials.diffuse_light import DiffuseLight
+from renderer.raytracer import MAX_BOUNCES, Renderer
 
 class Application:
     def __init__(self):
@@ -24,42 +25,44 @@ class Application:
         # Mouse control settings
         pygame.mouse.set_visible(False)  # Hide the cursor
         pygame.event.set_grab(True)      # Capture and lock the mouse
-        pygame.mouse.set_pos(self.window_width // 2, self.window_height // 2)  # Center the mouse
-        self.mouse_sensitivity = 0.002    # Adjust this to change mouse sensitivity
+        pygame.mouse.set_pos(self.window_width // 2, self.window_height // 2)
+        self.mouse_sensitivity = 0.001    # More precise mouse control
         self.mouse_locked = True         # Track mouse lock state
         
         # Set initial render scale for adaptive resolution
-        self.render_scale = 0.5  # Start at 50% resolution
+        self.render_scale = 1.0 
         self.target_fps = 30
         self.fps_history = []
         
-        # Calculate render resolution
-        self.update_render_resolution()
+        self.render_width = self.window_width
+        self.render_height = self.window_height
         
         # Create window
         self.screen = pygame.display.set_mode((self.window_width, self.window_height))
         pygame.display.set_caption("Real-Time Ray Tracer")
         
-        # Initialize camera with better FOV and position
+        # Initialize camera with depth of field
         self.aspect_ratio = self.window_width / self.window_height
         self.camera = Camera(
-            position=Vector3(0, 2, 10),  # Further back and higher up
+            position=Vector3(0, 2, 10),
             yaw=0.0,
-            pitch=-0.2,  # Look down slightly
-            fov=math.radians(60),  # Narrower FOV for less distortion
-            aspect_ratio=self.aspect_ratio
+            pitch=-0.2,
+            fov=math.radians(50),  # Slightly narrower FOV
+            aspect_ratio=self.aspect_ratio,
+            aperture=0.05,  # Small aperture for subtle depth of field
+            focus_dist=8.0   # Focus on the scene center
         )
         
-        # Initialize renderer
+        # Initialize renderer with higher bounce depth
         self.renderer = Renderer(
             self.render_width,
             self.render_height,
-            max_depth=2  # Reduced bounce depth for better performance
+            max_depth=MAX_BOUNCES
         )
         
         # Movement and rotation speeds
-        self.move_speed = 5.0  # Increased for better control
-        self.rotation_speed = math.radians(90)
+        self.move_speed = 3.0  # Slower for more precise control
+        self.rotation_speed = math.radians(60)
         
         # Setup the world
         self.world = self.create_world()
@@ -114,6 +117,11 @@ class Application:
         if move_dir.length() > 0:
             move_dir = move_dir.normalize() * self.move_speed * dt
             self.camera.position = self.camera.position + move_dir
+
+        # Reset accumulation when camera moves
+        if any([keys[k] for k in [pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d, 
+                                pygame.K_SPACE, pygame.K_LSHIFT]]):
+            self.renderer.reset_accumulation()
         
         # Update camera orientation
         self.camera.update_camera()
@@ -137,58 +145,40 @@ class Application:
                     elif event.type == pygame.KEYDOWN:
                         if event.key == pygame.K_ESCAPE:
                             running = False
-                        elif event.key == pygame.K_TAB:  # Toggle mouse capture
+                        elif event.key == pygame.K_TAB:
                             self.mouse_locked = not self.mouse_locked
                             if self.mouse_locked:
                                 pygame.event.set_grab(True)
                                 pygame.mouse.set_visible(False)
-                                # Re-center mouse when locking
                                 pygame.mouse.set_pos(self.window_width // 2, self.window_height // 2)
                             else:
                                 pygame.event.set_grab(False)
                                 pygame.mouse.set_visible(True)
-
-                # Handle input
-                self.handle_input(dt)
+                        elif event.key == pygame.K_SPACE:
+                            # Reset accumulation on space press
+                            self.renderer.reset_accumulation()
                 
-                # Update scene data in renderer periodically
-                current_time = pygame.time.get_ticks()
-                if current_time - last_scene_update > 1000:
-                    self.renderer.update_scene_data(self.world)
-                    last_scene_update = current_time
-
+                # Only update camera if mouse/keyboard input detected
+                if self.handle_input(dt):
+                    self.renderer.reset_accumulation()
+                
                 # Render frame
                 image = self.renderer.render_frame(self.camera, self.world)
-
-                # Convert and scale the image
+                
+                # Display
                 surf = pygame.surfarray.make_surface(image)
                 if self.render_width != self.window_width or self.render_height != self.window_height:
                     surf = pygame.transform.scale(surf, (self.window_width, self.window_height))
                 self.screen.blit(surf, (0, 0))
-
-                # Calculate and display FPS
-                frame_time = (pygame.time.get_ticks() - frame_start) / 1000.0
-                fps = 1.0 / frame_time if frame_time > 0 else 0
-                self.adjust_render_scale(fps)
                 
-                # Display performance metrics
-                fps_text = self.font.render(f"FPS: {int(fps)}", True, (255, 255, 255))
-                res_text = self.font.render(
-                    f"Resolution: {self.render_width}x{self.render_height} ({int(self.render_scale*100)}%)", 
-                    True, (255, 255, 255)
-                )
-                pos_text = self.font.render(
-                    f"Pos: ({self.camera.position.x:.1f}, {self.camera.position.y:.1f}, {self.camera.position.z:.1f})",
-                    True, (255, 255, 255)
-                )
+                # Show sample count
+                samples_text = self.font.render(
+                    f"Samples: {self.renderer.samples}", True, (255, 255, 255))
+                self.screen.blit(samples_text, (10, 130))
                 
-                self.screen.blit(fps_text, (10, 10))
-                self.screen.blit(res_text, (10, 50))
-                self.screen.blit(pos_text, (10, 90))
-
                 pygame.display.flip()
                 self.frame_count += 1
-        
+                
         finally:
             self.cleanup()
             pygame.quit()
@@ -221,53 +211,54 @@ class Application:
     def create_world(self) -> HittableList:
         world = HittableList()
         
-        # Ground (metallic for interesting reflections)
+        # Ground plane (darker and less reflective)
         world.add(Sphere(
             Vector3(0, -1000, 0), 1000,
-            Metal(Vector3(0.5, 0.5, 0.5), fuzz=0.05)
+            Metal(Vector3(0.3, 0.3, 0.3), fuzz=0.2)
         ))
         
-        # Add a mesh object
-        cube_material = Metal(Vector3(0.8, 0.6, 0.2), fuzz=0.1)
+        # Central red cube (more saturated color)
+        cube_material = Lambertian(Vector3(0.9, 0.2, 0.2))
         try:
             import os
             model_path = os.path.join(os.path.dirname(__file__), "models", "cube.obj")
-            print(f"Loading model from: {model_path}")
-            
-            if not os.path.exists(model_path):
-                print(f"Error: File does not exist at {model_path}")
-                all_files = os.listdir(os.path.join(os.path.dirname(__file__), "models"))
-                print(f"Files in models directory: {all_files}")
-            else:
+            if os.path.exists(model_path):
                 cube_mesh = load_obj(model_path, cube_material)
                 # Scale and position the cube
                 for triangle in cube_mesh.triangles:
-                    # Scale
-                    scale = 0.5
+                    scale = 2.0
                     triangle.v0 = triangle.v0 * scale
                     triangle.v1 = triangle.v1 * scale
                     triangle.v2 = triangle.v2 * scale
-                    # Position
-                    position = Vector3(0, 1, 0)
+                    position = Vector3(0, 1, -3)
                     triangle.v0 = triangle.v0 + position
                     triangle.v1 = triangle.v1 + position
                     triangle.v2 = triangle.v2 + position
                 world.add(cube_mesh)
-                print("Successfully loaded and added cube mesh")
         except Exception as e:
             print(f"Error loading model: {str(e)}")
-            import traceback
-            traceback.print_exc()
         
-        # Add some spheres around the cube
+        # Metallic spheres with different colors and properties
         world.add(Sphere(
             Vector3(2, 1, 0), 1.0,
-            Metal(Vector3(0.8, 0.6, 0.2), fuzz=0.1)
+            Metal(Vector3(0.8, 0.6, 0.2), fuzz=0.1)  # Gold-like
         ))
         
         world.add(Sphere(
             Vector3(-2, 1, 0), 1.0,
-            Metal(Vector3(0.8, 0.8, 0.8), fuzz=0.0)
+            Metal(Vector3(0.9, 0.9, 0.9), fuzz=0.05)  # Chrome-like
+        ))
+
+        # Main light source (reduced intensity and moved)
+        world.add(Sphere(
+            Vector3(0, 6, 2), 0.5,
+            DiffuseLight(Vector3(2.0, 1.9, 1.8))  # Slightly warm light
+        ))
+        
+        # Add a second, dimmer light for fill
+        world.add(Sphere(
+            Vector3(-3, 4, 3), 0.3,
+            DiffuseLight(Vector3(0.5, 0.5, 0.6))  # Slightly cool fill light
         ))
         
         return world

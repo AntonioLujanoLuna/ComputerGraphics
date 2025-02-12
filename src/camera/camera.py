@@ -4,23 +4,20 @@ from core.vector import Vector3
 from core.ray import Ray
 
 class Camera:
-    """
-    A simple camera that supports dynamic movement and rotation.
-    """
     def __init__(self, position: Vector3, yaw: float, pitch: float,
-                 fov: float, aspect_ratio: float):
+                 fov: float, aspect_ratio: float, aperture: float = 0.0, focus_dist: float = 10.0):
         self.position = position
-        self.yaw = yaw      # In radians
-        self.pitch = pitch  # In radians
-        self.fov = fov      # Field of view in radians
+        self.yaw = yaw
+        self.pitch = pitch
+        self.fov = fov
         self.aspect_ratio = aspect_ratio
-        self.focal_length = 1.0
+        self.aperture = aperture  # Lens aperture for depth of field
+        self.focus_dist = focus_dist  # Distance to focus plane
+        self.lens_radius = aperture / 2.0
         self.update_camera()
 
     def update_camera(self):
-        """
-        Updates the camera's basis vectors and viewport.
-        """
+        """Updates the camera's basis vectors and viewport."""
         global_up = Vector3(0, 1, 0)
         
         # Compute forward vector
@@ -38,20 +35,44 @@ class Camera:
         viewport_height = 2.0 * math.tan(self.fov / 2)
         viewport_width = self.aspect_ratio * viewport_height
 
-        self.horizontal = self.right * viewport_width
-        self.vertical = self.up * viewport_height
+        # Scale by focus distance
+        self.horizontal = self.right * viewport_width * self.focus_dist
+        self.vertical = self.up * viewport_height * self.focus_dist
 
         self.lower_left_corner = (self.position +
-                                self.forward * self.focal_length -
-                                self.horizontal * 0.5 -
-                                self.vertical * 0.5)
+                               self.forward * self.focus_dist -
+                               self.horizontal * 0.5 -
+                               self.vertical * 0.5)
 
-    def get_ray(self, u: float, v: float) -> Ray:
-        """
-        Generates a ray passing through the viewport coordinates (u, v).
-        """
-        direction = (self.lower_left_corner +
-                    self.horizontal * u +
-                    self.vertical * v -
-                    self.position)
-        return Ray(self.position, direction)
+    def get_ray(self, u: float, v: float, rng) -> Ray:
+        """Generates a ray with depth of field effect."""
+        if self.aperture <= 0:
+            direction = (self.lower_left_corner +
+                      self.horizontal * u +
+                      self.vertical * v -
+                      self.position)
+            return Ray(self.position, direction)
+        
+        # Generate random point on lens
+        rd = self.lens_radius * random_in_unit_disk(rng)
+        offset = self.right * rd.x + self.up * rd.y
+        
+        # Update ray origin and direction for depth of field
+        ray_origin = self.position + offset
+        ray_direction = (self.lower_left_corner +
+                       self.horizontal * u +
+                       self.vertical * v -
+                       ray_origin)
+        
+        return Ray(ray_origin, ray_direction)
+
+def random_in_unit_disk(rng) -> Vector3:
+    """Generate random point in unit disk for DOF."""
+    while True:
+        p = Vector3(
+            rng.uniform(-1, 1),
+            rng.uniform(-1, 1),
+            0
+        )
+        if p.dot(p) < 1:
+            return p
