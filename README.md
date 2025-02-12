@@ -1,82 +1,127 @@
-Below are three components to help you set up and run the real‑time ray tracer project:
+# Real-Time GPU Ray Tracer
 
----
-
-## 1. README.md
-
-Create a file named **README.md** with the following content:
-
-```markdown
-# Real-Time Ray Tracer
-
-This project implements a basic real‑time ray tracer in Python using Pygame and NumPy. The application demonstrates a simple dynamic scene featuring a sphere and a background gradient. You can control the camera in real time using keyboard input to move and rotate the view.
+A high-performance real-time ray tracer implemented in Python using CUDA acceleration through Numba. This application demonstrates physically-based rendering with features like global illumination, material systems, and dynamic camera controls.
 
 ## Features
 
-- **Interactive Camera Control:**  
-  Use the following keys to navigate the scene:  
-  - **W/S:** Move forward/backward  
-  - **A/D:** Strafe left/right  
-  - **Q/E:** Move up/down  
-  - **Arrow Keys:** Rotate the camera (yaw and pitch)
+### Rendering
+- Real-time path tracing with CUDA acceleration
+- Global illumination with multiple light bounces
+- Adaptive resolution scaling for consistent performance
+- Temporal accumulation for noise reduction
+- Physically-based materials (Lambertian, Metal)
+- Support for both spheres and triangle meshes (OBJ files)
+- Depth of field effects
+- Dynamic lighting with emissive materials
+- Environment lighting with sky and sun
 
-- **Real‑Time Rendering:**  
-  The scene is rendered at a low resolution for performance and then scaled to the window size for display.
+### Materials
+- Lambertian diffuse surfaces
+- Metallic surfaces with configurable roughness
+- Emissive materials for light sources
 
-- **Simple Scene:**  
-  The scene consists of a single sphere and a background gradient.
+### Camera System
+- Interactive camera controls
+- Configurable field of view
+- Depth of field with adjustable aperture
+- Motion-controlled accumulation reset
+
+### User Interface
+- Real-time FPS display
+- Sample count indicator
+- Adaptive resolution scaling
+- Mouse-look camera control
+- Toggle-able mouse capture
+
+## Controls
+
+- **WASD:** Move camera forward/left/backward/right
+- **Space/Left Shift:** Move camera up/down
+- **Mouse:** Look around
+- **Tab:** Toggle mouse capture
+- **Escape:** Exit application
 
 ## Requirements
 
 - Python 3.8 or higher
-- [Pygame](https://www.pygame.org/)
-- [NumPy](https://numpy.org/)
+- CUDA-capable NVIDIA GPU
+- Required Python packages:
+  - pygame
+  - numpy
+  - numba
+  - cudatoolkit
 
-## Setup Instructions
+## Installation
 
-### 1. Initialize a Virtual Environment
-
-It is recommended to use a virtual environment to manage dependencies.
-
-#### On macOS/Linux:
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
-
-#### On Windows:
-```bash
-python -m venv venv
-venv\Scripts\activate
-```
-
-### 2. Install Dependencies
-
-Once the virtual environment is activated, install the required packages using the provided `requirements.txt` file:
-
-```bash
-pip install -r requirements.txt
-```
-
-### 3. Run the Application
-
-Run the main Python script (e.g., `main.py`):
-
-```bash
-python main.py
-```
-
-A window will appear displaying the ray-traced scene. Use the keyboard controls to move and rotate the camera in real time.
+1. Ensure you have CUDA toolkit installed on your system
+2. Create and activate a virtual environment:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   ```
+3. Install required packages:
+   ```bash
+   pip install pygame numpy numba cudatoolkit
+   ```
 
 ## Project Structure
 
 ```
-real_time_ray_tracer/
-├── main.py           # The main Python script containing the ray tracer code.
-├── README.md         # This file.
-└── requirements.txt  # Contains the list of dependencies.
+src/
+├── camera/
+│   ├── __init__.py
+│   └── camera.py          # Camera system implementation
+├── core/
+│   ├── __init__.py
+│   ├── ray.py            # Ray class definition
+│   ├── utils.py          # Utility functions
+│   └── vector.py         # Vector3 class implementation
+├── geometry/
+│   ├── __init__.py
+│   ├── hittable.py       # Abstract base class for hittable objects
+│   ├── mesh.py           # Triangle mesh implementation
+│   ├── sphere.py         # Sphere primitive implementation
+│   └── world.py          # Scene management
+├── materials/
+│   ├── __init__.py
+│   ├── diffuse_light.py  # Emissive material
+│   ├── lambertian.py     # Diffuse material
+│   ├── material.py       # Base material class
+│   └── metal.py          # Metallic material
+├── renderer/
+│   ├── __init__.py
+│   └── raytracer.py      # CUDA-accelerated renderer
+└── main.py               # Application entry point
 ```
 
-## License
+## Performance Tips
 
-This project is provided as-is without any warranty.
+1. The renderer automatically adjusts resolution to maintain target frame rate
+2. Higher sample counts provide better image quality but require more processing power
+3. The depth of field effect can be adjusted by modifying the aperture and focus distance
+4. Scene complexity (number of objects and light bounces) affects performance
+
+## Implementation Details
+
+- Uses Numba CUDA for GPU acceleration
+- Implements physically-based path tracing
+- Features next-event estimation for efficient light sampling
+- Supports OBJ file loading for mesh geometry
+- Uses temporal accumulation for noise reduction
+- Implements Russian Roulette path termination
+
+## Known Limitations
+
+1. Currently only supports triangulated meshes
+2. Limited to static scenes (no animation support)
+3. Requires CUDA-capable NVIDIA GPU
+4. No texture mapping support
+
+## Future Improvements
+
+- Texture mapping support
+- BVH acceleration structure
+- Motion blur
+- Additional material types
+- Scene file format support
+- Animation system

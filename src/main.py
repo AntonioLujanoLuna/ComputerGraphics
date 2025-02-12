@@ -9,6 +9,7 @@ from geometry.sphere import Sphere
 from geometry.mesh import TriangleMesh, load_obj
 from materials.lambertian import Lambertian
 from materials.metal import Metal
+from materials.dielectric import Dielectric
 from materials.diffuse_light import DiffuseLight
 from renderer.raytracer import MAX_BOUNCES, Renderer
 
@@ -76,14 +77,18 @@ class Application:
         if hasattr(self, 'renderer'):
             self.renderer.cleanup()
 
-    def handle_input(self, dt: float):
+    def handle_input(self, dt: float) -> bool:
+        """
+        Process input and update the camera. Returns True if the camera has changed.
+        """
+        moved = False
         keys = pygame.key.get_pressed()
         
+        # Handle mouse movement for rotation
         if self.mouse_locked:
-            # Get mouse movement
             mouse_dx, mouse_dy = pygame.mouse.get_rel()
-            
-            # Update camera rotation based on mouse movement
+            if abs(mouse_dx) > 0 or abs(mouse_dy) > 0:
+                moved = True
             self.camera.yaw += mouse_dx * self.mouse_sensitivity
             self.camera.pitch -= mouse_dy * self.mouse_sensitivity
             
@@ -104,27 +109,31 @@ class Application:
         
         right = forward.cross(Vector3(0, 1, 0)).normalize()
         
-        # Movement with WASD
+        # Movement with WASD and vertical adjustments
         move_dir = Vector3(0, 0, 0)
-        if keys[pygame.K_w]: move_dir = move_dir + forward
-        if keys[pygame.K_s]: move_dir = move_dir - forward
-        if keys[pygame.K_a]: move_dir = move_dir - right
-        if keys[pygame.K_d]: move_dir = move_dir + right
-        if keys[pygame.K_SPACE]: move_dir = move_dir + Vector3(0, 1, 0)  # Up
-        if keys[pygame.K_LSHIFT]: move_dir = move_dir - Vector3(0, 1, 0)  # Down
+        if keys[pygame.K_w]: 
+            move_dir = move_dir + forward
+        if keys[pygame.K_s]: 
+            move_dir = move_dir - forward
+        if keys[pygame.K_a]: 
+            move_dir = move_dir - right
+        if keys[pygame.K_d]: 
+            move_dir = move_dir + right
+        if keys[pygame.K_SPACE]: 
+            move_dir = move_dir + Vector3(0, 1, 0)  # Up
+        if keys[pygame.K_LSHIFT]: 
+            move_dir = move_dir - Vector3(0, 1, 0)  # Down
         
-        # Apply movement
+        # Apply movement if any key was pressed
         if move_dir.length() > 0:
+            moved = True
             move_dir = move_dir.normalize() * self.move_speed * dt
             self.camera.position = self.camera.position + move_dir
-
-        # Reset accumulation when camera moves
-        if any([keys[k] for k in [pygame.K_w, pygame.K_s, pygame.K_a, pygame.K_d, 
-                                pygame.K_SPACE, pygame.K_LSHIFT]]):
-            self.renderer.reset_accumulation()
         
-        # Update camera orientation
+        # Update camera orientation and viewport
         self.camera.update_camera()
+        
+        return moved
 
     def run(self):
         try:
@@ -211,14 +220,27 @@ class Application:
     def create_world(self) -> HittableList:
         world = HittableList()
         
-        # Ground plane (darker and less reflective)
+        # Import presets
+        from materials.presets import MetalPresets, DielectricPresets, LightPresets, ColorPresets, TexturePresets
+        
+        # Ground plane with checkerboard pattern
+        ground_texture = TexturePresets.checkerboard(
+            ColorPresets.WHITE * 0.8,  # Slightly dimmer white
+            ColorPresets.BLACK * 0.2   # Very dark gray
+        )
         world.add(Sphere(
             Vector3(0, -1000, 0), 1000,
-            Metal(Vector3(0.3, 0.3, 0.3), fuzz=0.2)
+            Lambertian(ground_texture)
         ))
         
-        # Central red cube (more saturated color)
-        cube_material = Lambertian(Vector3(0.9, 0.2, 0.2))
+        # Marble sphere
+        world.add(Sphere(
+            Vector3(-3, 1, 2), 1.0,
+            Lambertian(TexturePresets.marble(scale=3.0, turbulence=6.0))
+        ))
+        
+        # Central red cube
+        cube_material = ColorPresets.matte(ColorPresets.RED)
         try:
             import os
             model_path = os.path.join(os.path.dirname(__file__), "models", "cube.obj")
@@ -238,27 +260,38 @@ class Application:
         except Exception as e:
             print(f"Error loading model: {str(e)}")
         
-        # Metallic spheres with different colors and properties
+        # Gold sphere
         world.add(Sphere(
             Vector3(2, 1, 0), 1.0,
-            Metal(Vector3(0.8, 0.6, 0.2), fuzz=0.1)  # Gold-like
+            MetalPresets.gold()
         ))
         
+        # Glass sphere
         world.add(Sphere(
             Vector3(-2, 1, 0), 1.0,
-            Metal(Vector3(0.9, 0.9, 0.9), fuzz=0.05)  # Chrome-like
-        ))
-
-        # Main light source (reduced intensity and moved)
-        world.add(Sphere(
-            Vector3(0, 6, 2), 0.5,
-            DiffuseLight(Vector3(2.0, 1.9, 1.8))  # Slightly warm light
+            DielectricPresets.glass()
         ))
         
-        # Add a second, dimmer light for fill
+        # Add a water drop (hollow sphere)
+        world.add(Sphere(
+            Vector3(0, 1, 2), 0.7,
+            DielectricPresets.glass()
+        ))
+        world.add(Sphere(
+            Vector3(0, 1, 2), -0.65,  # Slightly thicker water shell
+            DielectricPresets.water()
+        ))
+
+        # Main light source (warm light)
+        world.add(Sphere(
+            Vector3(0, 6, 2), 0.5,
+            LightPresets.warm_light(2.0)  # Higher intensity
+        ))
+        
+        # Fill light (cool light)
         world.add(Sphere(
             Vector3(-3, 4, 3), 0.3,
-            DiffuseLight(Vector3(0.5, 0.5, 0.6))  # Slightly cool fill light
+            LightPresets.cool_light(0.5)  # Lower intensity
         ))
         
         return world

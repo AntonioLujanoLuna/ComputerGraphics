@@ -27,3 +27,9 @@ class HittableList(Hittable):
                 hit_record = rec
 
         return hit_record
+    
+    def build_bvh(self):
+        from geometry.bvh import BVHNode
+        if len(self.objects) == 0:
+            return None
+        return BVHNode(self.objects, 0, len(self.objects))

@@ -2,18 +2,18 @@
 from typing import Optional
 from core.vector import Vector3
 from core.ray import Ray
+from core.uv import UV
 
 class HitRecord:
-    """
-    Records details of a ray-object intersection.
-    """
     def __init__(self, p: Vector3 = None, normal: Vector3 = None,
-                 t: float = 0, front_face: bool = True, material = None):
-        self.p = p              # Intersection point
-        self.normal = normal    # Surface normal at intersection
-        self.t = t              # Ray parameter at intersection
-        self.front_face = front_face  # Whether the hit was on the front side
+                 t: float = 0, front_face: bool = True, material = None,
+                 uv: UV = None):  # Add UV coordinates
+        self.p = p
+        self.normal = normal
+        self.t = t
+        self.front_face = front_face
         self.material = material
+        self.uv = uv if uv is not None else UV(0, 0)  # Default UV coordinates
 
     def set_face_normal(self, ray: Ray, outward_normal: Vector3):
         """

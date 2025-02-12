@@ -2,16 +2,20 @@
 import numpy as np
 from numba import cuda, float32, int32
 import math
-from numba import cuda, float32
 from numba.cuda.random import create_xoroshiro128p_states, xoroshiro128p_uniform_float32
 from core.vector import Vector3
 from core.ray import Ray
+from core.uv import UV
 from materials.metal import Metal
+from materials.dielectric import Dielectric
+from materials.textures import Texture, SolidTexture, ImageTexture
+from renderer.tone_mapping import reinhard_tone_mapping
+from typing import List
 
 # CUDA device constants
 INFINITY = float32(1e20)
-EPSILON = float32(1e-7)
-MAX_BOUNCES = 6
+EPSILON = float32(1e-20)
+MAX_BOUNCES = 16
 
 @cuda.jit(device=True)
 def random_in_unit_sphere(rng_states, thread_id, out):
@@ -135,6 +139,110 @@ def sample_light_contribution(
             out_color[i] += emission[i] * scale
 
 @cuda.jit(device=True)
+def calculate_sphere_uv(hit_point, center, out_uv):
+    """Calculate UV coordinates for a point on a sphere."""
+    # Convert hit point to sphere-local coordinates
+    local_point = cuda.local.array(3, dtype=float32)
+    for i in range(3):
+        local_point[i] = hit_point[i] - center[i]
+    
+    # Normalize the point
+    length = math.sqrt(dot(local_point, local_point))
+    for i in range(3):
+        local_point[i] /= length
+    
+    # Calculate spherical coordinates
+    phi = math.atan2(local_point[2], local_point[0])
+    theta = math.asin(local_point[1])
+    
+    # Convert to UV coordinates
+    out_uv[0] = 1.0 - (phi + math.pi) / (2.0 * math.pi)
+    out_uv[1] = (theta + math.pi/2.0) / math.pi
+
+@cuda.jit(device=True)
+def scatter_metal(incident, normal, albedo, rng_states, thread_id, out_scattered):
+    """Compute metal scattering."""
+    reflected = cuda.local.array(3, dtype=float32)
+    reflect(incident, normal, reflected)
+    
+    # Add fuzz
+    fuzz_vec = cuda.local.array(3, dtype=float32)
+    random_in_unit_sphere(rng_states, thread_id, fuzz_vec)
+    for i in range(3):
+        reflected[i] += 0.1 * fuzz_vec[i]  # Using fixed fuzz of 0.1
+    
+    normalize_inplace(reflected)
+    for i in range(3):
+        out_scattered[i] = reflected[i]
+    
+    return dot(out_scattered, normal) > 0
+
+@cuda.jit(device=True)
+def scatter_lambertian(normal, rng_states, thread_id, out_scattered):
+    """Compute Lambertian scattering."""
+    scatter_vec = cuda.local.array(3, dtype=float32)
+    random_in_unit_sphere(rng_states, thread_id, scatter_vec)
+    for i in range(3):
+        scatter_vec[i] += normal[i]
+    
+    normalize_inplace(scatter_vec)
+    for i in range(3):
+        out_scattered[i] = scatter_vec[i]
+    
+    return True
+
+@cuda.jit(device=True)
+def scatter_dielectric(current_dir, normal, ior, rng_states, thread_id, out_scattered):
+    """
+    Compute dielectric (glass) scattering.
+    """
+    # Normalize incoming ray direction
+    unit_direction = cuda.local.array(3, float32)
+    length = math.sqrt(dot(current_dir, current_dir))
+    for i in range(3):
+        unit_direction[i] = current_dir[i] / length
+    
+    # Determine if we're entering or exiting the material
+    front_face = dot(unit_direction, normal) < 0
+    etai_over_etat = 1.0 / ior if front_face else ior
+    
+    # Calculate cos_theta
+    cos_theta = min(-dot(unit_direction, normal), 1.0)
+    sin_theta = math.sqrt(1.0 - cos_theta * cos_theta)
+    
+    # Check for total internal reflection
+    if etai_over_etat * sin_theta > 1.0:
+        # Must reflect
+        reflected = cuda.local.array(3, float32)
+        reflect(unit_direction, normal, reflected)
+        for i in range(3):
+            out_scattered[i] = reflected[i]
+        return True
+    
+    # Calculate reflection probability using Schlick's approximation
+    reflect_prob = schlick(cos_theta, etai_over_etat)
+    
+    # Probabilistically choose reflection or refraction
+    if xoroshiro128p_uniform_float32(rng_states, thread_id) < reflect_prob:
+        reflected = cuda.local.array(3, float32)
+        reflect(unit_direction, normal, reflected)
+        for i in range(3):
+            out_scattered[i] = reflected[i]
+    else:
+        refracted = cuda.local.array(3, float32)
+        if refract(unit_direction, normal, etai_over_etat, refracted):
+            for i in range(3):
+                out_scattered[i] = refracted[i]
+        else:
+            # Fallback to reflection if refraction fails
+            reflected = cuda.local.array(3, float32)
+            reflect(unit_direction, normal, reflected)
+            for i in range(3):
+                out_scattered[i] = reflected[i]
+    
+    return True
+
+@cuda.jit(device=True)
 def sample_emissive_sphere(
     sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
     rng_states, thread_id,
@@ -180,6 +288,76 @@ def sample_emissive_sphere(
         out_emission[i] = sphere_materials[found_index * 3 + i]
     out_radius[0] = sphere_radii[found_index]
 
+@cuda.jit
+def compute_variance_kernel(accum_buffer, accum_buffer_sq, samples, out_mask):
+    """
+    For each pixel (x,y), compute the variance per channel from the accumulated color
+    and accumulated color squared, then average over channels.
+    If the average variance is below a threshold (here hard-coded to 0.001), mark the pixel as converged.
+    """
+    x, y = cuda.grid(2)
+    width = accum_buffer.shape[0]
+    height = accum_buffer.shape[1]
+    if x < width and y < height:
+        # Compute per-channel means.
+        mean_r = accum_buffer[x, y, 0] / samples
+        mean_g = accum_buffer[x, y, 1] / samples
+        mean_b = accum_buffer[x, y, 2] / samples
+        # Compute per-channel means of the square.
+        mean_sq_r = accum_buffer_sq[x, y, 0] / samples
+        mean_sq_g = accum_buffer_sq[x, y, 1] / samples
+        mean_sq_b = accum_buffer_sq[x, y, 2] / samples
+        # Compute variance for each channel.
+        var_r = mean_sq_r - mean_r * mean_r
+        var_g = mean_sq_g - mean_g * mean_g
+        var_b = mean_sq_b - mean_b * mean_b
+        # Average variance across channels.
+        avg_var = (var_r + var_g + var_b) / 3.0
+        # Write mask: 1 if converged, 0 otherwise.
+        if avg_var < 0.001:
+            out_mask[x, y] = 1
+        else:
+            out_mask[x, y] = 0
+
+@cuda.jit(device=True)
+def sample_texture(texture_data, texture_width, texture_height, u: float, v: float, out_color):
+    """Sample a texture at given UV coordinates."""
+    # Wrap UV coordinates
+    u = u % 1.0
+    v = 1.0 - (v % 1.0)  # Flip V coordinate for OpenGL-style UV
+    
+    # Convert to pixel coordinates
+    x = min(int(u * texture_width), texture_width - 1)
+    y = min(int(v * texture_height), texture_height - 1)
+    
+    # Get pixel index
+    idx = (y * texture_width + x) * 3
+    
+    # Copy color to output
+    out_color[0] = texture_data[idx]
+    out_color[1] = texture_data[idx + 1]
+    out_color[2] = texture_data[idx + 2]
+
+@cuda.jit(device=True)
+def interpolate_uv(uv0, uv1, uv2, u: float, v: float, out_uv):
+    """Interpolate UV coordinates using barycentric coordinates."""
+    w = 1.0 - u - v
+    out_uv[0] = w * uv0[0] + u * uv1[0] + v * uv2[0]
+    out_uv[1] = w * uv0[1] + u * uv1[1] + v * uv2[1]
+
+@cuda.jit(device=True)
+def halton(index, base):
+    """
+    Compute the Halton sequence value for a given index and base.
+    This is a simple low-discrepancy sequence generator.
+    """
+    f = 1.0
+    r = 0.0
+    while index > 0:
+        f = f / base
+        r = r + f * (index % base)
+        index = index // base
+    return r
 
 @cuda.jit(device=True)
 def compute_direct_light(
@@ -319,6 +497,37 @@ def reflect(out, v, n):
     return out
 
 @cuda.jit(device=True)
+def refract(v, n, ni_over_nt, out_refracted):
+    cos_theta = min(-dot(v, n), 1.0)
+    sin_theta = math.sqrt(1.0 - cos_theta * cos_theta)
+    
+    # Check for total internal reflection
+    if ni_over_nt * sin_theta > 1.0:
+        return False
+    
+    # Calculate refracted ray components
+    r_out_perp = cuda.local.array(3, float32)
+    r_out_parallel = cuda.local.array(3, float32)
+    
+    # Perpendicular component: ni_over_nt * (v + cos_theta * n)
+    for i in range(3):
+        r_out_perp[i] = ni_over_nt * v[i] + (ni_over_nt * cos_theta - math.sqrt(1.0 - ni_over_nt * ni_over_nt * sin_theta * sin_theta)) * n[i]
+    
+    # Copy result to output
+    for i in range(3):
+        out_refracted[i] = r_out_perp[i]
+    
+    # Ensure the refracted ray is normalized
+    normalize_inplace(out_refracted)
+    return True
+
+@cuda.jit(device=True)
+def schlick(cosine, ref_idx):
+    r0 = (1 - ref_idx) / (1 + ref_idx)
+    r0 = r0 * r0
+    return r0 + (1 - r0) * math.pow((1 - cosine), 5)
+
+@cuda.jit(device=True)
 def get_random_dir(seed, out):
     """Generate a random direction vector into the output array."""
     x = math.sin(seed * 12.9898) * 43758.5453
@@ -396,46 +605,89 @@ def ray_triangle_intersect(ray_origin, ray_dir, v0, v1, v2, t_min, t_max):
     return t
 
 @cuda.jit(device=True)
+def compute_triangle_normal(triangle, out_normal):
+    """
+    Compute the normal for a triangle.
+    
+    Parameters:
+      triangle: 1D array of 9 floats, representing [v0x, v0y, v0z, v1x, v1y, v1z, v2x, v2y, v2z].
+      out_normal: 1D array of 3 floats in which the normalized normal will be stored.
+    """
+    # Allocate temporary arrays for edge computations.
+    edge1 = cuda.local.array(3, dtype=float32)
+    edge2 = cuda.local.array(3, dtype=float32)
+    
+    # Compute edge1 = v1 - v0 and edge2 = v2 - v0.
+    for i in range(3):
+        edge1[i] = triangle[i + 3] - triangle[i]
+        edge2[i] = triangle[i + 6] - triangle[i]
+    
+    # Compute the cross product: out_normal = edge1 x edge2.
+    cross_inplace(out_normal, edge1, edge2)
+    
+    # Normalize the resulting normal.
+    normalize_inplace(out_normal)
+
+@cuda.jit(device=True)
 def trace_ray(origin, direction, max_bounces,
               sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
-              triangle_vertices, triangle_materials, triangle_material_types,
+              triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types,
+              texture_data, texture_dimensions, texture_indices,
               out_color,
               rng_states, thread_id):
     """
-    Improved path tracing with next-event estimation only on the first bounce
-    to avoid double-counting bright light sources.
+    Enhanced path tracing with texture support.
+    
+    Parameters:
+      origin, direction: Ray parameters.
+      max_bounces: Maximum number of bounces.
+      sphere_centers, sphere_radii, sphere_materials, sphere_material_types: Sphere data.
+      triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types: Triangle data.
+      texture_data: Flattened array of all texture data.
+      texture_dimensions: Width/height for each texture.
+      texture_indices: Maps materials to their textures.
+      out_color: Output color (array of 3 floats).
+      rng_states, thread_id: RNG state and thread index.
     """
-    current_origin = cuda.local.array(3, float32)
-    current_dir   = cuda.local.array(3, float32)
-    attenuation   = cuda.local.array(3, float32)
-    color         = cuda.local.array(3, float32)
-    temp_color    = cuda.local.array(3, float32)
+    # Local arrays for current ray parameters and accumulation.
+    current_origin = cuda.local.array(3, dtype=float32)
+    current_dir = cuda.local.array(3, dtype=float32)
+    attenuation = cuda.local.array(3, dtype=float32)
+    color = cuda.local.array(3, dtype=float32)
+    temp_color = cuda.local.array(3, dtype=float32)
+    uv_coords = cuda.local.array(2, dtype=float32)  # For texture sampling
 
-    # Initialize local arrays
     for i in range(3):
         current_origin[i] = origin[i]
-        current_dir[i]    = direction[i]
-        attenuation[i]    = 1.0
-        color[i]          = 0.0
-        temp_color[i]     = 0.0
+        current_dir[i] = direction[i]
+        attenuation[i] = 1.0
+        color[i] = 0.0
+        temp_color[i] = 0.0
 
+    # Main path-tracing loop over bounces.
     for bounce in range(max_bounces):
-        # 1) Find the closest intersection
-        closest_t   = INFINITY
-        hit_index   = -1
-        hit_sphere  = True
+        closest_t = INFINITY
+        hit_index = -1
+        hit_sphere = True  # True if the closest hit is a sphere; False for a triangle.
+        hit_u = 0.0
+        hit_v = 0.0
 
-        # Check spheres
+        # --- Intersect with spheres ---
         for s in range(sphere_centers.shape[0]):
             t = ray_sphere_intersect(current_origin, current_dir,
                                      sphere_centers[s], sphere_radii[s],
                                      float32(1e-4), closest_t)
             if t > 0.0:
-                closest_t  = t
-                hit_index  = s
+                closest_t = t
+                hit_index = s
                 hit_sphere = True
+                # Calculate spherical UV coordinates (for texture mapping)
+                hit_point = cuda.local.array(3, dtype=float32)
+                for i in range(3):
+                    hit_point[i] = current_origin[i] + t * current_dir[i]
+                calculate_sphere_uv(hit_point, sphere_centers[s], uv_coords)
 
-        # Check triangles
+        # --- Intersect with triangles ---
         for t_idx in range(triangle_vertices.shape[0]):
             t = ray_triangle_intersect(current_origin, current_dir,
                                        triangle_vertices[t_idx, 0:3],
@@ -443,77 +695,90 @@ def trace_ray(origin, direction, max_bounces,
                                        triangle_vertices[t_idx, 6:9],
                                        float32(1e-4), closest_t)
             if t > 0.0:
-                closest_t  = t
-                hit_index  = t_idx
+                closest_t = t
+                hit_index = t_idx
                 hit_sphere = False
+                # Interpolate triangle UV coordinates.
+                interpolate_uv(
+                    triangle_uvs[t_idx, 0:2],
+                    triangle_uvs[t_idx, 2:4],
+                    triangle_uvs[t_idx, 4:6],
+                    hit_u, hit_v, uv_coords
+                )
 
-        # 2) If no hit => sample environment (sky / sun) and break
+        # --- If no hit, sample the environment ---
         if hit_index < 0:
             sample_environment(current_dir, temp_color)
             for i in range(3):
                 color[i] += attenuation[i] * temp_color[i]
             break
 
-        # 3) Compute actual hit point, normal, and material
-        hit_point = cuda.local.array(3, float32)
-        normal    = cuda.local.array(3, float32)
-        mat_color = cuda.local.array(3, float32)
-        mat_type  = 0
+        # --- Compute hit point, surface normal, and material color ---
+        hit_point = cuda.local.array(3, dtype=float32)
+        normal = cuda.local.array(3, dtype=float32)
+        material_color = cuda.local.array(3, dtype=float32)
 
         for i in range(3):
             hit_point[i] = current_origin[i] + closest_t * current_dir[i]
 
         if hit_sphere:
-            # Sphere
-            sphere_radius = sphere_radii[hit_index]
-            center        = sphere_centers[hit_index]
+            # Compute sphere normal.
+            center = sphere_centers[hit_index]
             for i in range(3):
-                normal[i] = (hit_point[i] - center[i]) / sphere_radius
-            normalize_inplace(normal)
-
+                normal[i] = (hit_point[i] - center[i]) / sphere_radii[hit_index]
+            # Flip the normal if the ray is inside the sphere.
+            if dot(current_dir, normal) > 0.0:
+                for i in range(3):
+                    normal[i] = -normal[i]
             mat_type = sphere_material_types[hit_index]
-            base_idx = hit_index * 3
-            for i in range(3):
-                mat_color[i] = sphere_materials[base_idx + i]
-
+            mat_idx = hit_index * 3
+            if texture_indices[hit_index] >= 0:
+                tex_idx = texture_indices[hit_index]
+                sample_texture(
+                    texture_data,
+                    texture_dimensions[tex_idx, 0],
+                    texture_dimensions[tex_idx, 1],
+                    uv_coords[0], uv_coords[1],
+                    material_color
+                )
+            else:
+                for i in range(3):
+                    material_color[i] = sphere_materials[mat_idx + i]
         else:
-            # Triangle
-            v0 = cuda.local.array(3, float32)
-            v1 = cuda.local.array(3, float32)
-            v2 = cuda.local.array(3, float32)
-            for i in range(3):
-                v0[i] = triangle_vertices[hit_index, i]
-                v1[i] = triangle_vertices[hit_index, 3 + i]
-                v2[i] = triangle_vertices[hit_index, 6 + i]
-
-            e1 = cuda.local.array(3, float32)
-            e2 = cuda.local.array(3, float32)
-            for i in range(3):
-                e1[i] = v1[i] - v0[i]
-                e2[i] = v2[i] - v0[i]
-            cross_inplace(normal, e1, e2)
-            normalize_inplace(normal)
-
+            # For triangles: compute normal and get material color.
+            compute_triangle_normal(triangle_vertices[hit_index], normal)
             mat_type = triangle_material_types[hit_index]
-            base_idx = hit_index * 3
-            for i in range(3):
-                mat_color[i] = triangle_materials[base_idx + i]
+            mat_idx = hit_index * 3
+            if texture_indices[hit_index + sphere_centers.shape[0]] >= 0:
+                tex_idx = texture_indices[hit_index + sphere_centers.shape[0]]
+                sample_texture(
+                    texture_data,
+                    texture_dimensions[tex_idx, 0],
+                    texture_dimensions[tex_idx, 1],
+                    uv_coords[0], uv_coords[1],
+                    material_color
+                )
+            else:
+                for i in range(3):
+                    material_color[i] = triangle_materials[mat_idx + i]
 
-        # 4) If emissive material, add emission & break
+        # --- For dielectric materials (mat_type == 3), override material_color to white ---
+        if mat_type == 3:
+            ior = material_color[0]  # Extract the refractive index.
+            for i in range(3):
+                material_color[i] = 1.0
+        # --- Handle emissive materials (mat_type == 2) ---
         if mat_type == 2:
             for i in range(3):
-                color[i] += attenuation[i] * mat_color[i]
+                color[i] += attenuation[i] * material_color[i]
             break
 
-        # 5) Next-event estimation: do it ONLY on the first bounce
-        #    to avoid double-counting big light sources.
+        # --- Next-event estimation on the first bounce ---
         if bounce == 0:
-            for i in range(3):
-                temp_color[i] = 0.0
-
             compute_direct_light(
                 hit_point, normal,
-                sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
+                sphere_centers, sphere_radii,
+                sphere_materials, sphere_material_types,
                 triangle_vertices, triangle_materials, triangle_material_types,
                 rng_states, thread_id,
                 temp_color
@@ -521,148 +786,113 @@ def trace_ray(origin, direction, max_bounces,
             for i in range(3):
                 color[i] += attenuation[i] * temp_color[i]
 
-        # 6) Scatter the ray according to material type
+        # --- Scatter based on material type ---
+        scattered = cuda.local.array(3, dtype=float32)
+        scattered_valid = False
+        if mat_type == 1:  # Metal
+            scattered_valid = scatter_metal(current_dir, normal, material_color,
+                                            rng_states, thread_id, scattered)
+        elif mat_type == 3:  # Dielectric
+            scattered_valid = scatter_dielectric(current_dir, normal, ior,
+                                                 rng_states, thread_id, scattered)
+        else:  # Lambertian
+            scattered_valid = scatter_lambertian(normal, rng_states, thread_id, scattered)
 
-        if mat_type == 1:
-            # Metal
-            reflected = cuda.local.array(3, float32)
-            reflect(reflected, current_dir, normal)
+        if not scattered_valid:
+            break
 
-            # Add some small fuzz for demonstration
-            fuzz_vec = cuda.local.array(3, float32)
-            random_in_unit_sphere(rng_states, thread_id, fuzz_vec)
-            fuzz_amount = 0.05
-            for i in range(3):
-                reflected[i] += fuzz_amount * fuzz_vec[i]
-            normalize_inplace(reflected)
+        # *** NEW: Normalize the scattered ray direction ***
+        normalize_inplace(scattered)
 
-            # Update attenuation
-            for i in range(3):
-                attenuation[i] *= mat_color[i]
+        # Update the ray and attenuation for the next bounce.
+        for i in range(3):
+            current_origin[i] = hit_point[i]
+            current_dir[i] = scattered[i]
+            attenuation[i] *= material_color[i]
 
-            # Next ray
-            for i in range(3):
-                current_origin[i] = hit_point[i]
-                current_dir[i]    = reflected[i]
-
-            # If reflection is inward, end
-            if dot(current_dir, normal) <= 0.0:
-                break
-
-        else:
-            # Lambertian / diffuse
-            scatter_vec = cuda.local.array(3, float32)
-            random_in_unit_sphere(rng_states, thread_id, scatter_vec)
-
-            # direction = normal + random
-            for i in range(3):
-                scatter_vec[i] += normal[i]
-            normalize_inplace(scatter_vec)
-
-            # Update attenuation
-            for i in range(3):
-                attenuation[i] *= mat_color[i]
-
-            # Next ray
-            for i in range(3):
-                current_origin[i] = hit_point[i]
-                current_dir[i]    = scatter_vec[i]
-
-        # 7) Russian roulette for bounces > 3
+        # --- Russian roulette termination after 3 bounces ---
         if bounce >= 3:
             luminance = 0.2126 * attenuation[0] + 0.7152 * attenuation[1] + 0.0722 * attenuation[2]
             q = max(0.05, min(0.95, luminance))
             if xoroshiro128p_uniform_float32(rng_states, thread_id) > q:
                 break
-
             inv_q = 1.0 / q
             for i in range(3):
                 attenuation[i] *= inv_q
 
-    # Write final color
+    # Write the final accumulated color to the output.
     for i in range(3):
         out_color[i] = color[i]
 
 @cuda.jit
 def render_kernel(width, height,
-                  camera_origin,
-                  camera_lower_left,
-                  camera_horizontal,
-                  camera_vertical,
-                  sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
-                  triangle_vertices, triangle_materials, triangle_material_types,
-                  out_image, frame_number,
-                  rng_states):
+                 camera_origin,
+                 camera_lower_left,
+                 camera_horizontal,
+                 camera_vertical,
+                 sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
+                 triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types,
+                 texture_data, texture_dimensions, texture_indices,
+                 out_image, frame_number,
+                 rng_states):
     """
-    GPU kernel that computes the linear radiance for each pixel by tracing rays.
-    
-    This modified version outputs raw, linear radiance values instead of converting
-    the computed color to 8-bit integers. The accumulation and tone mapping are then
-    performed on the host in linear space.
-    
-    Args:
-        width (int): Image width.
-        height (int): Image height.
-        camera_origin (array of float32, shape [3]): The camera origin.
-        camera_lower_left (array of float32, shape [3]): The lower-left corner of the viewport.
-        camera_horizontal (array of float32, shape [3]): The horizontal vector for the viewport.
-        camera_vertical (array of float32, shape [3]): The vertical vector for the viewport.
-        sphere_centers: GPU array of sphere centers.
-        sphere_radii: GPU array of sphere radii.
-        sphere_materials: GPU array of sphere material colors/emissions.
-        sphere_material_types: GPU array of sphere material types.
-        triangle_vertices: GPU array of triangle vertex data.
-        triangle_materials: GPU array of triangle material colors/emissions.
-        triangle_material_types: GPU array of triangle material types.
-        out_image: Output GPU array to store the linear radiance (float32) for each pixel.
-        frame_number (int): Current frame number (unused here, but passed in).
-        rng_states: RNG states array for random number generation.
+    GPU kernel that computes the linear radiance for each pixel.
+    This version uses shared memory for camera parameters for better memory access.
     """
-    # Get pixel coordinates from the CUDA grid.
+    # Allocate shared memory for camera parameters (size 3 each)
+    shared_origin = cuda.shared.array(shape=3, dtype=float32)
+    shared_lower_left = cuda.shared.array(shape=3, dtype=float32)
+    shared_horizontal = cuda.shared.array(shape=3, dtype=float32)
+    shared_vertical = cuda.shared.array(shape=3, dtype=float32)
+
+    # Let thread (0,0) of each block load the camera parameters.
+    if cuda.threadIdx.x == 0 and cuda.threadIdx.y == 0:
+        for i in range(3):
+            shared_origin[i] = camera_origin[i]
+            shared_lower_left[i] = camera_lower_left[i]
+            shared_horizontal[i] = camera_horizontal[i]
+            shared_vertical[i] = camera_vertical[i]
+    cuda.syncthreads()
+
+    # Compute pixel coordinates.
     x, y = cuda.grid(2)
     if x >= width or y >= height:
         return
 
-    # Compute a unique pixel index for RNG state access.
     pixel_idx = x + y * width
 
-    # Allocate local arrays for the ray origin, direction, and color.
+    # Local arrays for the ray origin, direction, and color.
     ray_origin = cuda.local.array(3, dtype=float32)
-    ray_dir    = cuda.local.array(3, dtype=float32)
-    color      = cuda.local.array(3, dtype=float32)
-
-    # Initialize the ray origin and color.
+    ray_dir = cuda.local.array(3, dtype=float32)
+    color = cuda.local.array(3, dtype=float32)
     for i in range(3):
-        ray_origin[i] = camera_origin[i]
+        ray_origin[i] = shared_origin[i]
         color[i] = 0.0
 
-    # Anti-aliasing: add a small jitter using random numbers.
-    jitter_x = xoroshiro128p_uniform_float32(rng_states, pixel_idx) / width
-    jitter_y = xoroshiro128p_uniform_float32(rng_states, pixel_idx) / height
-
-    # Compute normalized u and v coordinates in the viewport.
+    # Anti-aliasing: add a small jitter.
+    jitter_x = halton(pixel_idx, 2) / width
+    jitter_y = halton(pixel_idx, 3) / height
     u = (float32(x) + jitter_x) / float32(width - 1)
     v = 1.0 - ((float32(y) + jitter_y) / float32(height - 1))
 
-    # Reconstruct the ray direction from the camera parameters.
-    # The direction is computed from the lower-left corner plus horizontal and vertical offsets.
+    # Reconstruct the ray direction.
     for i in range(3):
-        val = camera_lower_left[i] + u * camera_horizontal[i] + v * camera_vertical[i] - camera_origin[i]
-        ray_dir[i] = val
+        # Calculate: lower_left + u * horizontal + v * vertical - origin.
+        temp = shared_lower_left[i] + u * shared_horizontal[i] + v * shared_vertical[i] - shared_origin[i]
+        ray_dir[i] = temp
 
-    # Normalize the computed ray direction.
+    # Normalize the ray direction.
     normalize_inplace(ray_dir)
 
-    # Trace the ray through the scene. The trace_ray function accumulates the radiance.
+    # Trace the ray (using your existing trace_ray function).
     trace_ray(ray_origin, ray_dir, MAX_BOUNCES,
-              sphere_centers, sphere_radii,
-              sphere_materials, sphere_material_types,
-              triangle_vertices, triangle_materials, triangle_material_types,
-              color,
-              rng_states, pixel_idx)
+            sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
+            triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types,
+            texture_data, texture_dimensions, texture_indices,
+            color,
+            rng_states, pixel_idx)
 
-    # Write the linear radiance to the output image.
-    # Do not convert to 8-bit here; conversion is done after accumulation.
+    # Write the computed color to the output image.
     for i in range(3):
         out_image[x, y, i] = color[i]
 
@@ -674,9 +904,10 @@ class Renderer:
 
         self.frame_number = 0
         self.accumulation_buffer = np.zeros((width, height, 3), dtype=np.float32)
+        self.accumulation_buffer_sq = np.zeros((width, height, 3), dtype=np.float32)  # For variance
         self.samples = 0
 
-        # CUDA config
+        # CUDA config remains as before.
         self.threadsperblock = (16, 16)
         self.blockspergrid_x = math.ceil(width / self.threadsperblock[0])
         self.blockspergrid_y = math.ceil(height / self.threadsperblock[1])
@@ -686,7 +917,7 @@ class Renderer:
         n_states = width * height
         self.rng_states = create_xoroshiro128p_states(n_states, seed=42)
 
-        # Prepare GPU arrays (set to None initially)
+        # GPU arrays for scene data are initialized to None.
         self.d_sphere_centers = None
         self.d_sphere_radii   = None
         self.d_sphere_materials = None
@@ -695,9 +926,42 @@ class Renderer:
         self.d_triangle_materials = None
         self.d_triangle_material_types = None
 
+        # Add UV and texture-related GPU arrays
+        self.d_triangle_uvs = None
+        self.d_texture_data = None
+        self.d_texture_indices = None
+        self.texture_dimensions = None
+
+        # Add texture-related GPU arrays
+        self.d_texture_data = None
+        self.d_texture_indices = None  # Maps materials to textures
+        self.texture_dimensions = None  # Stores width/height for each texture
+    
+    def load_textures(self, textures: List[Texture]):
+        """Load textures to GPU memory."""
+        # Convert textures to flat array
+        texture_data = []
+        texture_dimensions = []
+        
+        for texture in textures:
+            if isinstance(texture, ImageTexture):
+                # Flatten RGB data
+                flat_data = texture.data.reshape(-1)
+                texture_data.extend(flat_data)
+                texture_dimensions.append((texture.width, texture.height))
+            elif isinstance(texture, SolidTexture):
+                # Create 1x1 texture for solid colors
+                texture_data.extend([texture.color.x, texture.color.y, texture.color.z])
+                texture_dimensions.append((1, 1))
+                
+        # Transfer to GPU
+        self.d_texture_data = cuda.to_device(np.array(texture_data, dtype=np.float32))
+        self.texture_dimensions = cuda.to_device(np.array(texture_dimensions, dtype=np.int32))
+
     def reset_accumulation(self):
-        """Reset the accumulation buffer when the camera moves."""
+        """Reset the accumulation buffers when the camera or scene changes."""
         self.accumulation_buffer.fill(0)
+        self.accumulation_buffer_sq.fill(0)
         self.samples = 0
         
     def update_scene_data(self, world):
@@ -705,7 +969,6 @@ class Renderer:
         Convert scene data (spheres, meshes) into GPU‐friendly arrays,
         handling Lambertian, Metal, and DiffuseLight materials properly.
         """
-
         # 1. Count spheres & triangles
         sphere_count = sum(1 for obj in world.objects if hasattr(obj, 'radius'))
         mesh_objects = [obj for obj in world.objects if hasattr(obj, 'triangles')]
@@ -719,6 +982,11 @@ class Renderer:
         radii = np.zeros(max(1, sphere_count), dtype=np.float32)
         sphere_materials = np.zeros(max(1, sphere_count) * 3, dtype=np.float32)
         sphere_material_types = np.zeros(max(1, sphere_count), dtype=np.int32)
+
+        num_texture_entries = sphere_count + triangle_count
+        # Create a default texture indices array (all -1 means “no texture”)
+        default_texture_indices = -1 * np.ones((num_texture_entries,), dtype=np.int32)
+        self.d_texture_indices = cuda.to_device(default_texture_indices)
         
         # 4. Fill sphere arrays
         sphere_idx = 0
@@ -728,37 +996,42 @@ class Renderer:
                 centers[sphere_idx] = [obj.center.x, obj.center.y, obj.center.z]
                 radii[sphere_idx] = obj.radius
 
-                # Prepare the base index for storing color
+                # Prepare the base index for storing material parameters.
                 mat_idx = sphere_idx * 3
                 
-                # Distinguish between material types
                 mat = obj.material
                 if hasattr(mat, 'emitted') and callable(mat.emitted):
-                    # It's a DiffuseLight (emissive)
+                    # DiffuseLight (emissive)
                     emission = mat.emitted(0, 0, obj.center)
-                    sphere_materials[mat_idx:mat_idx+3] = [
-                        emission.x, emission.y, emission.z
-                    ]
-                    sphere_material_types[sphere_idx] = 2  # "2" means emissive
+                    sphere_materials[mat_idx:mat_idx+3] = [emission.x, emission.y, emission.z]
+                    sphere_material_types[sphere_idx] = 2  # emissive
                 elif isinstance(mat, Metal):
-                    # Metal
-                    sphere_materials[mat_idx:mat_idx+3] = [
-                        mat.albedo.x, mat.albedo.y, mat.albedo.z
-                    ]
-                    sphere_material_types[sphere_idx] = 1  # "1" means metal
+                    if hasattr(mat, 'texture') and mat.texture is not None:
+                        sphere_materials[mat_idx:mat_idx+3] = [
+                            mat.texture.color.x, mat.texture.color.y, mat.texture.color.z
+                        ]
+                    sphere_material_types[sphere_idx] = 1  # metal
+                elif isinstance(mat, Dielectric):
+                    # For dielectrics, we store the refractive index in the red channel.
+                    sphere_materials[mat_idx:mat_idx+3] = [mat.ref_idx, 0.0, 0.0]
+                    sphere_material_types[sphere_idx] = 3  # dielectric
                 else:
-                    # Assume Lambertian (or fallback)
-                    # You might do: "elif isinstance(mat, Lambertian): ..."
-                    # but “else” is fine if there are no other types
-                    sphere_materials[mat_idx:mat_idx+3] = [
-                        mat.albedo.x, mat.albedo.y, mat.albedo.z
-                    ]
-                    sphere_material_types[sphere_idx] = 0  # "0" means lambertian
-                
+                    # Lambertian or other materials
+                    if hasattr(mat, 'texture') and mat.texture is not None:
+                        if hasattr(mat.texture, 'color'):  # SolidTexture
+                            sphere_materials[mat_idx:mat_idx+3] = [
+                                mat.texture.color.x, mat.texture.color.y, mat.texture.color.z
+                            ]
+                        else:  # Other texture types
+                            # Sample center of texture for base color
+                            color = mat.texture.sample(UV(0.5, 0.5))
+                            sphere_materials[mat_idx:mat_idx+3] = [color.x, color.y, color.z]
+                    sphere_material_types[sphere_idx] = 0  # lambertian
                 sphere_idx += 1
         
         # 5. Prepare arrays for triangles
         triangle_vertices = np.zeros((max(1, triangle_count), 9), dtype=np.float32)
+        triangle_uvs = np.zeros((max(1, triangle_count), 6), dtype=np.float32)  # 6 values for 3 UV coordinates
         triangle_materials = np.zeros(max(1, triangle_count) * 3, dtype=np.float32)
         triangle_material_types = np.zeros(max(1, triangle_count), dtype=np.int32)
         
@@ -766,10 +1039,15 @@ class Renderer:
         triangle_idx = 0
         for mesh in mesh_objects:
             for triangle in mesh.triangles:
-                # Store the triangle’s 3 vertices
+                # Store vertices as before
                 triangle_vertices[triangle_idx, 0:3] = [triangle.v0.x, triangle.v0.y, triangle.v0.z]
                 triangle_vertices[triangle_idx, 3:6] = [triangle.v1.x, triangle.v1.y, triangle.v1.z]
                 triangle_vertices[triangle_idx, 6:9] = [triangle.v2.x, triangle.v2.y, triangle.v2.z]
+                
+                # Store UV coordinates
+                triangle_uvs[triangle_idx, 0:2] = [triangle.uv0.u, triangle.uv0.v]
+                triangle_uvs[triangle_idx, 2:4] = [triangle.uv1.u, triangle.uv1.v]
+                triangle_uvs[triangle_idx, 4:6] = [triangle.uv2.u, triangle.uv2.v]
 
                 # Prepare the base index for color
                 mat_idx = triangle_idx * 3
@@ -781,15 +1059,22 @@ class Renderer:
                     triangle_materials[mat_idx:mat_idx+3] = [emission.x, emission.y, emission.z]
                     triangle_material_types[triangle_idx] = 2
                 elif isinstance(mat, Metal):
-                    triangle_materials[mat_idx:mat_idx+3] = [
-                        mat.albedo.x, mat.albedo.y, mat.albedo.z
-                    ]
+                    if hasattr(mat, 'texture') and mat.texture is not None:
+                        triangle_materials[mat_idx:mat_idx+3] = [
+                            mat.texture.color.x, mat.texture.color.y, mat.texture.color.z
+                        ]
                     triangle_material_types[triangle_idx] = 1
                 else:
-                    # Assume Lambertian if not metal or emissive
-                    triangle_materials[mat_idx:mat_idx+3] = [
-                        mat.albedo.x, mat.albedo.y, mat.albedo.z
-                    ]
+                    # Lambertian or other materials
+                    if hasattr(mat, 'texture') and mat.texture is not None:
+                        if hasattr(mat.texture, 'color'):  # SolidTexture
+                            triangle_materials[mat_idx:mat_idx+3] = [
+                                mat.texture.color.x, mat.texture.color.y, mat.texture.color.z
+                            ]
+                        else:  # Other texture types
+                            # Sample center of texture for base color
+                            color = mat.texture.sample(UV(0.5, 0.5))
+                            triangle_materials[mat_idx:mat_idx+3] = [color.x, color.y, color.z]
                     triangle_material_types[triangle_idx] = 0
 
                 triangle_idx += 1
@@ -799,86 +1084,85 @@ class Renderer:
         self.d_sphere_radii   = cuda.to_device(np.ascontiguousarray(radii))
         self.d_sphere_materials = cuda.to_device(np.ascontiguousarray(sphere_materials))
         self.d_sphere_material_types = cuda.to_device(np.ascontiguousarray(sphere_material_types))
-        
+        self.d_triangle_uvs = cuda.to_device(np.ascontiguousarray(triangle_uvs))
         self.d_triangle_vertices = cuda.to_device(np.ascontiguousarray(triangle_vertices))
         self.d_triangle_materials = cuda.to_device(np.ascontiguousarray(triangle_materials))
         self.d_triangle_material_types = cuda.to_device(np.ascontiguousarray(triangle_material_types))
-    
+
+        # Collect all unique textures
+        textures = set()
+        for obj in world.objects:
+            if hasattr(obj, 'material') and hasattr(obj.material, 'texture'):
+                textures.add(obj.material.texture)
+        
+        # Load textures to GPU
+        self.load_textures(list(textures))
+
     def render_frame(self, camera, world) -> np.ndarray:
-        """
-        Renders a frame with temporal accumulation for noise reduction.
-        """
         if self.d_sphere_centers is None:
             self.update_scene_data(world)
 
-        # Camera setup remains the same...
-        camera_origin = np.array([
-            camera.position.x,
-            camera.position.y,
-            camera.position.z
-        ], dtype=np.float32)
+        # Set up camera parameters
+        camera_origin = np.array([camera.position.x, camera.position.y, camera.position.z], dtype=np.float32)
+        camera_lower_left = np.array([camera.lower_left_corner.x, camera.lower_left_corner.y, camera.lower_left_corner.z], dtype=np.float32)
+        camera_horizontal = np.array([camera.horizontal.x, camera.horizontal.y, camera.horizontal.z], dtype=np.float32)
+        camera_vertical = np.array([camera.vertical.x, camera.vertical.y, camera.vertical.z], dtype=np.float32)
 
-        camera_lower_left = np.array([
-            camera.lower_left_corner.x,
-            camera.lower_left_corner.y,
-            camera.lower_left_corner.z
-        ], dtype=np.float32)
+        # Allocate output array
+        frame_output = cuda.pinned_array((self.width, self.height, 3), dtype=np.float32)
+        stream = cuda.stream()
+        d_frame_output = cuda.to_device(frame_output, stream=stream)
 
-        camera_horizontal = np.array([
-            camera.horizontal.x,
-            camera.horizontal.y,
-            camera.horizontal.z
-        ], dtype=np.float32)
-
-        camera_vertical = np.array([
-            camera.vertical.x,
-            camera.vertical.y,
-            camera.vertical.z
-        ], dtype=np.float32)
-
-        # Create output array for this frame
-        frame_output = np.zeros((self.width, self.height, 3), dtype=np.float32)
-        d_frame_output = cuda.to_device(frame_output)
-
-        # Render new frame
-        render_kernel[self.blockspergrid, self.threadsperblock](
+        # Launch kernel with ALL parameters
+        render_kernel[self.blockspergrid, self.threadsperblock, stream](
             self.width,
             self.height,
             camera_origin,
             camera_lower_left,
             camera_horizontal,
             camera_vertical,
-            self.d_sphere_centers, self.d_sphere_radii,
-            self.d_sphere_materials, self.d_sphere_material_types,
-            self.d_triangle_vertices, self.d_triangle_materials, self.d_triangle_material_types,
+            self.d_sphere_centers,
+            self.d_sphere_radii,
+            self.d_sphere_materials,
+            self.d_sphere_material_types,
+            self.d_triangle_vertices,
+            self.d_triangle_uvs,
+            self.d_triangle_materials,
+            self.d_triangle_material_types,
+            self.d_texture_data,
+            self.texture_dimensions,
+            self.d_texture_indices,
             d_frame_output,
             self.frame_number,
             self.rng_states
         )
 
-        # Get frame data back from GPU
-        frame_output = d_frame_output.copy_to_host()
+        stream.synchronize()
+        frame_output = d_frame_output.copy_to_host(stream=stream)
+        stream.synchronize()
 
-        # Accumulate into buffer
         self.accumulation_buffer += frame_output
+        self.accumulation_buffer_sq += frame_output ** 2
         self.samples += 1
-        
-        # Average accumulated frames
-        averaged = self.accumulation_buffer / self.samples
 
-        # Tone mapping (to handle bright areas better)
-        exposure = 1.0
-        mapped = 1.0 - np.exp(-averaged * exposure)
-        
-        # Gamma correction with slightly higher gamma for better contrast
-        gamma = 2.2
-        mapped = np.power(mapped, 1.0 / gamma)
-        
-        # Convert to 8-bit RGB
-        output = np.clip(mapped * 255, 0, 255).astype(np.uint8)
-        
+        averaged = self.accumulation_buffer / self.samples
+        output = reinhard_tone_mapping(averaged, exposure=1.0, white_point=1.0, gamma=2.2)
+
         self.frame_number += 1
         return output
+
+    def has_converged(self, threshold: float = 0.001) -> bool:
+        """
+        Computes the per‑pixel variance over the accumulation buffer.
+        Returns True if the average variance is below the threshold.
+        """
+        if self.samples == 0:
+            return False
+        mean = self.accumulation_buffer / self.samples
+        mean_sq = self.accumulation_buffer_sq / self.samples
+        variance = mean_sq - mean ** 2
+        avg_variance = np.mean(variance)
+        return avg_variance < threshold
     
     def cleanup(self):
         """Clean up CUDA memory."""
@@ -889,15 +1173,23 @@ class Renderer:
                 del self.d_sphere_materials
                 del self.d_sphere_material_types
                 del self.d_triangle_vertices
+                del self.d_triangle_uvs  # Add this
                 del self.d_triangle_materials
                 del self.d_triangle_material_types
+                if self.d_texture_data is not None:
+                    del self.d_texture_data
+                    del self.d_texture_indices
             
             self.d_sphere_centers = None
             self.d_sphere_radii = None
             self.d_sphere_materials = None
             self.d_sphere_material_types = None
             self.d_triangle_vertices = None
+            self.d_triangle_uvs = None  # Add this
             self.d_triangle_materials = None
             self.d_triangle_material_types = None
+            self.d_texture_data = None
+            self.d_texture_indices = None
+            self.texture_dimensions = None
         except Exception as e:
             print(f"Warning: Error during CUDA cleanup: {str(e)}")

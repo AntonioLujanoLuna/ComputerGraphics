@@ -4,6 +4,7 @@ from typing import Optional
 from core.vector import Vector3
 from core.ray import Ray
 from geometry.hittable import Hittable, HitRecord
+from core.aabb import AABB 
 
 class Sphere(Hittable):
     """
@@ -39,3 +40,8 @@ class Sphere(Hittable):
         rec.set_face_normal(ray, outward_normal)
         rec.material = self.material
         return rec
+    
+    def bounding_box(self) -> AABB:
+        # The bounding box of a sphere is simply its center ± radius.
+        offset = Vector3(self.radius, self.radius, self.radius)
+        return AABB(self.center - offset, self.center + offset)
