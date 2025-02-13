@@ -1,4 +1,5 @@
 # main.py
+from doctest import debug
 import math
 import pygame
 import numpy as np
@@ -11,6 +12,7 @@ from materials.lambertian import Lambertian
 from materials.metal import Metal
 from materials.dielectric import Dielectric
 from materials.diffuse_light import DiffuseLight
+from renderer.tone_mapping import reinhard_tone_mapping
 from renderer.raytracer import MAX_BOUNCES, Renderer
 
 class Application:
@@ -137,6 +139,9 @@ class Application:
 
     def run(self):
         try:
+            # Update renderer's scene data before rendering.
+            self.renderer.update_scene_data(self.world)
+
             running = True
             last_scene_update = 0
             
@@ -172,19 +177,15 @@ class Application:
                     self.renderer.reset_accumulation()
                 
                 # Render frame
-                image = self.renderer.render_frame(self.camera, self.world)
+                image = self.renderer.render_frame_adaptive(self.camera, self.world)
+                mapped_image = reinhard_tone_mapping(image, exposure=1.0, white_point=1.0, gamma=2.2)
+                surf = pygame.surfarray.make_surface(mapped_image)
                 
-                # Display
-                surf = pygame.surfarray.make_surface(image)
                 if self.render_width != self.window_width or self.render_height != self.window_height:
                     surf = pygame.transform.scale(surf, (self.window_width, self.window_height))
                 self.screen.blit(surf, (0, 0))
                 
-                # Show sample count
-                samples_text = self.font.render(
-                    f"Samples: {self.renderer.samples}", True, (255, 255, 255))
-                self.screen.blit(samples_text, (10, 130))
-                
+                # Show sample count, update display, etc.
                 pygame.display.flip()
                 self.frame_count += 1
                 

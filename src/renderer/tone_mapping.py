@@ -1,3 +1,4 @@
+# renderer/tone_mapping.py
 
 def reinhard_tone_mapping(accumulated, exposure=1.0, white_point=1.0, gamma=2.2):
     """
