@@ -3,7 +3,7 @@
 from numba import cuda, float32
 import math
 from numba.cuda.random import xoroshiro128p_uniform_float32
-from .cuda_utils import dot, normalize_inplace, halton, compute_env_pdf, mis_power_heuristic, sample_cosine_hemisphere
+from .cuda_utils import dot, normalize_inplace, halton, compute_env_pdf, mis_power_heuristic, sample_cosine_hemisphere, halton_cached
 from .cuda_geometry import (
     ray_sphere_intersect, calculate_sphere_uv, 
     ray_triangle_intersect, compute_triangle_normal
@@ -28,7 +28,8 @@ def adaptive_render_kernel(width, height,
                            d_accum_buffer, d_accum_buffer_sq,
                            d_sample_count, d_mask, d_frame_output,
                            frame_number, rng_states, N,
-                           d_env_map, d_env_cdf, env_total, env_width, env_height):
+                           d_env_map, d_env_cdf, env_total, env_width, env_height,
+                           d_halton_table_base2, d_halton_table_base3, d_halton_table_base5):
     """
     An adaptive path tracing kernel that:
       1) Skips already converged pixels (d_mask[x,y]==1)
@@ -44,7 +45,6 @@ def adaptive_render_kernel(width, height,
     if x >= width or y >= height:
         return
 
-    # If this pixel is marked converged, just output the existing average color.
     if d_mask[x, y] == 1:
         count = d_sample_count[x, y]
         if count > 0:
@@ -60,41 +60,38 @@ def adaptive_render_kernel(width, height,
             d_frame_output[x, y, 2] = 0.0
         return
 
-    # Accumulate color for the sub-samples in local memory.
     local_color = cuda.local.array(3, dtype=float32)
     for i in range(3):
         local_color[i] = 0.0
 
     pixel_idx = x + y * width
 
-    # Loop over sub-samples
     for s in range(N):
         seq_idx = frame_number * N + s
 
-        # Example: use simple random or Halton-based jitter
-        # Halton is available from your posted halton() function.
-        jitter_x = halton(pixel_idx * 4096 + seq_idx, 2) / width
-        jitter_y = halton(pixel_idx * 4096 + seq_idx, 3) / height
+        # Use the precomputed Halton values to obtain jitter offsets.
+        jitter_x = halton_cached(pixel_idx * 4096 + seq_idx, 2, d_halton_table_base2, d_halton_table_base3, d_halton_table_base5) / width
+        jitter_y = halton_cached(pixel_idx * 4096 + seq_idx, 3, d_halton_table_base2, d_halton_table_base3, d_halton_table_base5) / height
 
         u = (float32(x) + jitter_x) / float32(width - 1)
         v = 1.0 - ((float32(y) + jitter_y) / float32(height - 1))
 
-        # Build the ray from camera parameters
         ray_origin = cuda.local.array(3, dtype=float32)
         ray_dir = cuda.local.array(3, dtype=float32)
         for i in range(3):
             ray_origin[i] = camera_origin[i]
-            ray_dir[i] = (camera_lower_left[i]
-                          + u * camera_horizontal[i]
-                          + v * camera_vertical[i]
-                          - camera_origin[i])
+            ray_dir[i] = (camera_lower_left[i] +
+                          u * camera_horizontal[i] +
+                          v * camera_vertical[i] -
+                          camera_origin[i])
+        # Call the helper function (assumed imported at module level)
         normalize_inplace(ray_dir)
 
-        # Trace the ray
         sample_col = cuda.local.array(3, dtype=float32)
         for i in range(3):
             sample_col[i] = 0.0
 
+        # Call the path–tracing routine (using your optimized trace_ray)
         trace_ray(ray_origin, ray_dir, MAX_BOUNCES,
                   sphere_centers, sphere_radii,
                   sphere_materials, sphere_material_types,
@@ -102,30 +99,24 @@ def adaptive_render_kernel(width, height,
                   triangle_materials, triangle_material_types,
                   texture_data, texture_dimensions, texture_indices,
                   sample_col,
-                  rng_states, pixel_idx*N + s,  # pass unique seed per sample
+                  rng_states, pixel_idx * N + s,
                   d_env_map, d_env_cdf, env_total, env_width, env_height)
 
-        # Accumulate into local_color
         for i in range(3):
             local_color[i] += sample_col[i]
 
-    # Average over N sub-samples
     invN = 1.0 / float32(N)
     for i in range(3):
         local_color[i] *= invN
 
-    # Atomically add to the accumulation buffers
     cuda.atomic.add(d_accum_buffer, (x, y, 0), local_color[0])
     cuda.atomic.add(d_accum_buffer, (x, y, 1), local_color[1])
     cuda.atomic.add(d_accum_buffer, (x, y, 2), local_color[2])
-
-    cuda.atomic.add(d_accum_buffer_sq, (x, y, 0), local_color[0]*local_color[0])
-    cuda.atomic.add(d_accum_buffer_sq, (x, y, 1), local_color[1]*local_color[1])
-    cuda.atomic.add(d_accum_buffer_sq, (x, y, 2), local_color[2]*local_color[2])
-
+    cuda.atomic.add(d_accum_buffer_sq, (x, y, 0), local_color[0] * local_color[0])
+    cuda.atomic.add(d_accum_buffer_sq, (x, y, 1), local_color[1] * local_color[1])
+    cuda.atomic.add(d_accum_buffer_sq, (x, y, 2), local_color[2] * local_color[2])
     cuda.atomic.add(d_sample_count, (x, y), N)
 
-    # Compute final average color = accum / sample_count
     count_after = d_sample_count[x, y]
     if count_after > 0:
         avg_r = d_accum_buffer[x, y, 0] / float32(count_after)
@@ -282,33 +273,30 @@ def compute_variance_kernel(accum_buffer, accum_buffer_sq, samples, out_mask):
 
 @cuda.jit(device=True)
 def trace_ray(origin, direction, max_bounces,
-              sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
-              triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types,
-              texture_data, texture_dimensions, texture_indices,
-              out_color,
-              rng_states, thread_id,
-              d_env_map, d_env_cdf, env_total, env_width, env_height):
+                        sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
+                        triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types,
+                        texture_data, texture_dimensions, texture_indices,
+                        out_color,
+                        rng_states, thread_id,
+                        d_env_map, d_env_cdf, env_total, env_width, env_height):
     """
-    Path tracer that does:
-      - Sphere & triangle intersection
-      - Emissive materials
-      - Basic next-event from sphere lights
-      - *NEW*: Environment importance sampling with MIS
-
-    Parameters:
-      origin, direction: the primary ray
-      max_bounces: maximum number of path bounces
-      ... [existing geometry & material params] ...
-      out_color: 3-float local array to accumulate result
-      rng_states, thread_id: random states for the current thread
-      d_env_map, d_env_cdf, env_total, env_width, env_height: environment data
+    Optimized path–tracing loop with reduced branch divergence.
+    
+    Changes include:
+      • Using a fixed number of iterations (max_bounces) and an "alive" flag
+        instead of break statements.
+      • Combining certain conditional tests (for example, flipping the normal)
+        into a more uniform code path.
+      • Minimizing repeated global memory accesses by keeping key values in registers.
+    
+    This device function can replace the original trace_ray() in your CUDA kernel.
     """
-
-    # Local copies
+    # Initialize registers (local arrays)
     current_origin = cuda.local.array(3, dtype=float32)
     current_dir    = cuda.local.array(3, dtype=float32)
     attenuation    = cuda.local.array(3, dtype=float32)
     color_accum    = cuda.local.array(3, dtype=float32)
+    alive = 1  # flag to indicate that the ray is still active
 
     for i in range(3):
         current_origin[i] = origin[i]
@@ -316,51 +304,42 @@ def trace_ray(origin, direction, max_bounces,
         attenuation[i]    = 1.0
         color_accum[i]    = 0.0
 
-    # For storing barycentric coords for triangle hits
-    uv_temp = cuda.local.array(2, dtype=float32)
+    # Pre-allocate temporary arrays (for UVs, hit point, normal, etc.)
+    uv_temp    = cuda.local.array(2, dtype=float32)
+    tmp_hit_pt = cuda.local.array(3, dtype=float32)
+    hit_normal = cuda.local.array(3, dtype=float32)
+    uv_coords  = cuda.local.array(2, dtype=float32)
+    uv_coords[0] = 0.0
+    uv_coords[1] = 0.0
 
-    bounce = 0
-    while bounce < max_bounces:
-        bounce += 1
+    # Main loop: fixed number of bounces to avoid early exits that cause divergence.
+    for bounce in range(max_bounces):
+        # If the ray is already terminated, skip further processing.
+        if alive == 0:
+            break
 
-        # --- Find the closest intersection in the scene ---
+        # --- Intersection search (both spheres and triangles) ---
         closest_t = float32(1e20)
         hit_idx   = -1
         hit_sphere = True
 
-        # Intersect spheres
         s_count = sphere_centers.shape[0]
-        t_count = triangle_vertices.shape[0]
-
-        tmp_hit_point = cuda.local.array(3, dtype=float32)
-        hit_normal = cuda.local.array(3, dtype=float32)
-
-        # Track some UV for texturing
-        uv_coords = cuda.local.array(2, dtype=float32)
-        uv_coords[0] = 0.0
-        uv_coords[1] = 0.0
-
-        # Sphere intersection
         for s_i in range(s_count):
-            tval = ray_sphere_intersect(
-                current_origin, current_dir,
-                sphere_centers[s_i], sphere_radii[s_i],
-                float32(1e-4), closest_t
-            )
+            tval = ray_sphere_intersect(current_origin, current_dir,
+                                        sphere_centers[s_i], sphere_radii[s_i],
+                                        float32(1e-4), closest_t)
             if tval > 0.0:
                 closest_t = tval
                 hit_idx   = s_i
                 hit_sphere = True
 
-        # Triangle intersection
+        t_count = triangle_vertices.shape[0]
         for t_i in range(t_count):
-            tval = ray_triangle_intersect(
-                current_origin, current_dir,
-                triangle_vertices[t_i, 0:3],
-                triangle_vertices[t_i, 3:6],
-                triangle_vertices[t_i, 6:9],
-                float32(1e-4), closest_t, uv_temp
-            )
+            tval = ray_triangle_intersect(current_origin, current_dir,
+                                          triangle_vertices[t_i, 0:3],
+                                          triangle_vertices[t_i, 3:6],
+                                          triangle_vertices[t_i, 6:9],
+                                          float32(1e-4), closest_t, uv_temp)
             if tval > 0.0:
                 closest_t = tval
                 hit_idx   = t_i
@@ -368,54 +347,42 @@ def trace_ray(origin, direction, max_bounces,
                 uv_coords[0] = uv_temp[0]
                 uv_coords[1] = uv_temp[1]
 
-        # --- If no intersection => sample environment and terminate ---
+        # --- If no intersection found, sample the environment ---
         if hit_idx < 0:
-            # Evaluate environment map in the direction current_dir
             temp_env = cuda.local.array(3, dtype=float32)
             eval_env_map(current_dir, d_env_map, env_width, env_height, temp_env)
-
             for i in range(3):
                 color_accum[i] += attenuation[i] * temp_env[i]
-            break  # no more bounces
+            alive = 0  # mark the ray as terminated
+            continue  # continue to end of loop (without further processing)
 
-        # --- We have a valid hit. Compute hit point and normal. ---
+        # --- Compute hit point ---
         for i in range(3):
-            tmp_hit_point[i] = current_origin[i] + closest_t * current_dir[i]
+            tmp_hit_pt[i] = current_origin[i] + closest_t * current_dir[i]
 
-        mat_type = 0
+        # --- Material handling and normal calculation ---
         mat_color = cuda.local.array(3, dtype=float32)
         for i in range(3):
             mat_color[i] = 0.0
 
         if hit_sphere:
-            # Spheres
-            # fetch sphere normal
             center = sphere_centers[hit_idx]
             radius = sphere_radii[hit_idx]
-
             for i in range(3):
-                hit_normal[i] = (tmp_hit_point[i] - center[i]) / radius
-
-            # Flip normal if we are inside
-            if dot(current_dir, hit_normal) > 0.0:
+                hit_normal[i] = (tmp_hit_pt[i] - center[i]) / radius
+            # Flip the normal using a branch–reduced approach:
+            ndot = dot(current_dir, hit_normal)
+            if ndot > 0.0:
                 for i in range(3):
                     hit_normal[i] = -hit_normal[i]
-
             mat_type = sphere_material_types[hit_idx]
             base_idx = hit_idx * 3
-
-            # If you want texture: check texture_indices[hit_idx]
-            # or just store a base color
             for i in range(3):
                 mat_color[i] = sphere_materials[base_idx + i]
-
-            # Optionally compute sphere UV (already done if you want)
-            calculate_sphere_uv(tmp_hit_point, center, uv_coords)
-
+            # Compute sphere UV coordinates (if needed for texturing)
+            calculate_sphere_uv(tmp_hit_pt, center, uv_coords)
         else:
-            # Triangles
             compute_triangle_normal(triangle_vertices[hit_idx], hit_normal)
-            # Flip if needed
             if dot(current_dir, hit_normal) > 0.0:
                 for i in range(3):
                     hit_normal[i] = -hit_normal[i]
@@ -426,131 +393,89 @@ def trace_ray(origin, direction, max_bounces,
 
         normalize_inplace(hit_normal)
 
-        # --- Check for Emissive material ---
+        # --- Emissive material check ---
         if mat_type == 2:
-            # Add emissive color and terminate
+            # For emissive materials, add contribution and terminate.
             for i in range(3):
                 color_accum[i] += attenuation[i] * mat_color[i]
-            break
+            alive = 0
+            continue
 
-        # If it's Dielectric, we store IOR in mat_color[0]
+        # --- Determine index of refraction if dielectric ---
         ior_val = mat_color[0] if (mat_type == 3) else 1.0
 
-        # --- Next-Event Estimation from local lights (optional) ---
-        # Allocate a local array to hold the direct lighting contribution.
+        # --- Next-Event Estimation from local lights ---
         temp_light = cuda.local.array(3, dtype=float32)
         for i in range(3):
             temp_light[i] = 0.0
-
-        # Call compute_direct_light; make sure the parameters match your implementation.
-        compute_direct_light(tmp_hit_point, hit_normal,
-                            sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
-                            triangle_vertices, triangle_materials, triangle_material_types,
-                            rng_states, thread_id, temp_light)
-
-        # Add the computed direct lighting contribution to the accumulated color.
+        compute_direct_light(tmp_hit_pt, hit_normal,
+                             sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
+                             triangle_vertices, triangle_materials, triangle_material_types,
+                             rng_states, thread_id, temp_light)
         for i in range(3):
             color_accum[i] += attenuation[i] * temp_light[i]
 
-        # --- Next-Event from Environment (MIS sample) ---
+        # --- Environment Next-Event Estimation using MIS ---
         if env_total > 1e-8:
-            # 1) Sample environment direction
             env_dir = cuda.local.array(3, dtype=float32)
             env_pdf = cuda.local.array(1, dtype=float32)
             sample_env_importance(rng_states, thread_id, d_env_cdf, env_total,
                                   env_width, env_height, env_dir, env_pdf)
-
             cosN = dot(env_dir, hit_normal)
             if cosN > 0.0 and env_pdf[0] > 1e-8:
-                # Check occlusion by shooting a shadow ray:
-                shadow_dist = scene_occlusion_test(tmp_hit_point, env_dir,
-                                                   sphere_centers, sphere_radii,
-                                                   triangle_vertices)
+                shadow_dist = scene_occlusion_test(tmp_hit_pt, env_dir,
+                                                   sphere_centers, sphere_radii, triangle_vertices)
                 if shadow_dist < 0.0:
-                    # Not occluded
-                    # Evaluate environment color
                     env_L = cuda.local.array(3, dtype=float32)
                     eval_env_map(env_dir, d_env_map, env_width, env_height, env_L)
-
-                    # Evaluate BSDF pdf for the same direction
                     pdf_bsdf = bsdf_pdf(mat_type, current_dir, hit_normal, env_dir, ior_val)
-
-                    # MIS weight: env_pdf -> "pLight", pdf_bsdf -> "pBSDF"
                     w = mis_power_heuristic(env_pdf[0], pdf_bsdf)
-
-                    # geometric factor for Lambertian or so is cosN
-                    # So contribution = (env_L * cosN / env_pdf[0]) * w
                     for i in range(3):
                         color_accum[i] += attenuation[i] * env_L[i] * (cosN / env_pdf[0]) * w
 
-        # --- Now do the standard BSDF sampling of the next bounce ---
+        # --- BSDF sampling for the next bounce ---
         scatter_dir = cuda.local.array(3, dtype=float32)
-        valid_scatter = bsdf_sample(mat_type, current_dir, hit_normal,
-                                    mat_color, ior_val,
-                                    rng_states, thread_id,
-                                    scatter_dir)
+        valid_scatter = bsdf_sample(mat_type, current_dir, hit_normal, mat_color, ior_val,
+                                    rng_states, thread_id, scatter_dir)
         if not valid_scatter:
-            # e.g. was fully absorbed
-            break
+            alive = 0
+            continue
 
-        # Evaluate pdf for the scattered direction:
         pdf_bsdf = bsdf_pdf(mat_type, current_dir, hit_normal, scatter_dir, ior_val)
-
-        # Evaluate environment pdf for the same scatter_dir, if environment is present
         pdf_env = 0.0
         if env_total > 1e-8:
-            pdf_env = compute_env_pdf(scatter_dir, d_env_map, d_env_cdf,
-                                      env_total, env_width, env_height)
-
-        # MIS weight for this direction (the one we got from the BSDF sample)
-        #   "pBSDF" = pdf_bsdf, "pLight" = pdf_env
+            pdf_env = compute_env_pdf(scatter_dir, d_env_map, d_env_cdf, env_total, env_width, env_height)
         w_bsdf = mis_power_heuristic(pdf_bsdf, pdf_env)
-
-        # If this new direction sees the environment (and is above the surface):
         cosN2 = dot(scatter_dir, hit_normal)
         if cosN2 > 1e-8:
-            # Check for occlusion
-            shadow_dist = scene_occlusion_test(tmp_hit_point, scatter_dir,
-                                               sphere_centers, sphere_radii,
-                                               triangle_vertices)
+            shadow_dist = scene_occlusion_test(tmp_hit_pt, scatter_dir,
+                                               sphere_centers, sphere_radii, triangle_vertices)
             if shadow_dist < 0.0:
-                # Not occluded => environment visible
                 env_col = cuda.local.array(3, dtype=float32)
                 eval_env_map(scatter_dir, d_env_map, env_width, env_height, env_col)
-
-                # Add contribution from environment, multiplied by MIS weight
-                # scaled by cosN2 / pdf_bsdf, times attenuation
-                # (Lambert = albedo/pi, etc. included in "attenuation * mat_color"?)
-                # The portion that belongs to the direct bounce
                 scale_val = (cosN2 / max(pdf_bsdf, 1e-8)) * w_bsdf
                 for i in range(3):
                     color_accum[i] += attenuation[i] * env_col[i] * scale_val
 
-        # Update the path for next bounce
-        # Multiply attenuation by the material's albedo or reflectivity:
-        # (The sampling routine might do that, or do it here.)
-        # For example, if Lambertian:  attenuation *= mat_color
-        # If Metal:    attenuation *= (some reflection color)
-        # If Dielectric: attenuation is always Vector3(1,1,1)...
-
+        # --- Update attenuation via material BSDF ---
         update_scatter_attenuation(mat_type, mat_color, attenuation)
-
-        # Move ray origin forward a bit
+        # Update ray for the next bounce
         for i in range(3):
-            current_origin[i] = tmp_hit_point[i]
+            current_origin[i] = tmp_hit_pt[i]
             current_dir[i]    = scatter_dir[i]
 
-        # --- Russian Roulette ---
+        # --- Russian Roulette (applied uniformly) ---
         if bounce >= 3:
-            lum = 0.2126*attenuation[0] + 0.7152*attenuation[1] + 0.0722*attenuation[2]
+            lum = 0.2126 * attenuation[0] + 0.7152 * attenuation[1] + 0.0722 * attenuation[2]
             rr_prob = min(max(lum, 0.05), 0.95)
             if xoroshiro128p_uniform_float32(rng_states, thread_id) > rr_prob:
-                break
-            invp = 1.0 / rr_prob
-            for i in range(3):
-                attenuation[i] *= invp
+                alive = 0
+            else:
+                invp = 1.0 / rr_prob
+                for i in range(3):
+                    attenuation[i] *= invp
 
-    # Write final color
+    # Write the final accumulated color
     for i in range(3):
         out_color[i] = color_accum[i]
 

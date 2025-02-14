@@ -10,6 +10,8 @@ from .cuda_kernels import adaptive_render_kernel, compute_variance_mask_kernel
 from renderer.cuda_temporal import temporal_reprojection_kernel
 from renderer.env_importance import build_env_cdf
 from core.uv import UV
+from .env_map_utils import generate_gradient_env_map
+from renderer.cuda_utils import MAX_HALTON_SAMPLES, precompute_halton_tables
 
 # CUDA device constants
 INFINITY = float32(1e20)
@@ -17,7 +19,7 @@ EPSILON = float32(1e-20)
 MAX_BOUNCES = 16
 
 class Renderer:    
-    def __init__(self, width: int, height: int, N: int = 8, max_depth: int = 3, debug_mode: bool = False):
+    def __init__(self, width: int, height: int, N: int = 16, max_depth: int = 4, debug_mode: bool = False):
         self.width = width
         self.height = height
         self.max_depth = max_depth
@@ -27,15 +29,15 @@ class Renderer:
         self.accumulation_buffer_sq = np.zeros((width, height, 3), dtype=np.float32)
         self.samples = 0
 
-        self.threadsperblock = (16, 16)
+        self.threadsperblock = (16,8)
         self.blockspergrid_x = math.ceil(width / self.threadsperblock[0])
         self.blockspergrid_y = math.ceil(height / self.threadsperblock[1])
         self.blockspergrid = (self.blockspergrid_x, self.blockspergrid_y)
         n_states = width * height * N
         self.rng_states = create_xoroshiro128p_states(n_states, seed=42)
 
-        # Initialize environment map attributes
-        default_env = np.ones((1, 1, 3), dtype=np.float32)  # Simple white environment
+        # --- Use a real (generated) environment map ---
+        default_env = generate_gradient_env_map(512, 256)
         cdf, total, w, h = build_env_cdf(default_env)
         self.d_env_map = cuda.to_device(default_env)
         self.d_env_cdf = cuda.to_device(cdf)
@@ -44,7 +46,7 @@ class Renderer:
         self.env_height = h
         self.N = N
 
-        # Scene GPU arrays
+        # (The rest of your scene and buffer initialization follows...)
         self.d_sphere_centers = None
         self.d_sphere_radii = None
         self.d_sphere_materials = None
@@ -76,7 +78,14 @@ class Renderer:
         self.prev_camera_up = None
         self.prev_focus = None
 
-        # Ensure that the accumulation and depth buffers are allocated
+        # Precompute three Halton tables on the host.
+        halton_table_base2_host, halton_table_base3_host, halton_table_base5_host = precompute_halton_tables(MAX_HALTON_SAMPLES)
+
+        # Upload the precomputed tables to the device.
+        self.d_halton_table_base2 = cuda.to_device(halton_table_base2_host)
+        self.d_halton_table_base3 = cuda.to_device(halton_table_base3_host)
+        self.d_halton_table_base5 = cuda.to_device(halton_table_base5_host)
+
         self.reset_accumulation()
 
     def load_textures(self, textures: list):
@@ -234,6 +243,26 @@ class Renderer:
         self.d_sample_count = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32))
         self.d_mask = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32))
 
+        # Build the BVH over the world objects.
+        world.build_bvh()
+
+        # If the BVH was built, upload the flattened arrays to device memory.
+        if world.bvh_flat is not None:
+            bbox_min, bbox_max, left_indices, right_indices, is_leaf, object_indices = world.bvh_flat
+            self.d_bvh_bbox_min = cuda.to_device(bbox_min)
+            self.d_bvh_bbox_max = cuda.to_device(bbox_max)
+            self.d_bvh_left = cuda.to_device(left_indices)
+            self.d_bvh_right = cuda.to_device(right_indices)
+            self.d_bvh_is_leaf = cuda.to_device(is_leaf)
+            self.d_bvh_object_indices = cuda.to_device(object_indices)
+        else:
+            self.d_bvh_bbox_min = None
+            self.d_bvh_bbox_max = None
+            self.d_bvh_left = None
+            self.d_bvh_right = None
+            self.d_bvh_is_leaf = None
+            self.d_bvh_object_indices = None
+
     def render_frame_adaptive(self, camera, world) -> np.ndarray:
         # Set up current camera parameters.
         camera_origin = np.array(
@@ -326,8 +355,8 @@ class Renderer:
             self.d_texture_data, self.texture_dimensions, self.d_texture_indices,
             self.d_accum_buffer, self.d_accum_buffer_sq, self.d_sample_count,
             self.d_mask, d_frame_output, self.frame_number, self.rng_states, self.N,
-            # New environment arguments:
-            self.d_env_map, self.d_env_cdf, self.env_total, self.env_width, self.env_height
+            self.d_env_map, self.d_env_cdf, self.env_total, self.env_width, self.env_height,
+            self.d_halton_table_base2, self.d_halton_table_base3, self.d_halton_table_base5
         )
         stream.synchronize()
 

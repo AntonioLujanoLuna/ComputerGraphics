@@ -52,7 +52,7 @@ class Application:
             pitch=-0.2,
             fov=math.radians(50),  # Slightly narrower FOV
             aspect_ratio=self.aspect_ratio,
-            aperture=0.05,  # Small aperture for subtle depth of field
+            aperture=0.01,  # Small aperture for subtle depth of field
             focus_dist=8.0   # Focus on the scene center
         )
         
@@ -178,7 +178,8 @@ class Application:
                 
                 # Render frame
                 image = self.renderer.render_frame_adaptive(self.camera, self.world)
-                mapped_image = reinhard_tone_mapping(image, exposure=1.0, white_point=1.0, gamma=2.2)
+                #mapped_image = reinhard_tone_mapping(image, exposure=1.0, white_point=1.0, gamma=2.2)
+                mapped_image = reinhard_tone_mapping(image, exposure=2.0, white_point=2.0, gamma=2.2)
                 surf = pygame.surfarray.make_surface(mapped_image)
                 
                 if self.render_width != self.window_width or self.render_height != self.window_height:
@@ -286,14 +287,11 @@ class Application:
         # Main light source (warm light)
         world.add(Sphere(
             Vector3(0, 6, 2), 0.5,
-            LightPresets.warm_light(2.0)  # Higher intensity
+            LightPresets.warm_light(5.0)  # Higher intensity
         ))
-        
-        # Fill light (cool light)
-        world.add(Sphere(
-            Vector3(-3, 4, 3), 0.3,
-            LightPresets.cool_light(0.5)  # Lower intensity
-        ))
+
+        # Build the BVH over everything:
+        world.build_bvh()
         
         return world
     
@@ -309,6 +307,16 @@ class Application:
         self.screen.blit(res_text, (10, 50))
 
 def main():
+    # Force CUDA initialization and check
+    import numba.cuda
+    if not numba.cuda.is_available():
+        print("CUDA is not available. Check your GPU and drivers.")
+        return
+    
+    # Print CUDA device info
+    device = numba.cuda.get_current_device()
+    print(f"Using CUDA device: {device.name}")
+    
     app = Application()
     app.run()
 

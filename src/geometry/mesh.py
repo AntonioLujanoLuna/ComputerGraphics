@@ -64,6 +64,36 @@ class TriangleMesh(Hittable):
         self.triangles = triangles
         self.material = material
 
+    def bounding_box(self) -> AABB:
+        """
+        Compute an AABB that encloses all triangles in this mesh.
+        Returns None if there are no triangles.
+        """
+        if not self.triangles:
+            return None
+
+        min_x = float('inf')
+        min_y = float('inf')
+        min_z = float('inf')
+        max_x = float('-inf')
+        max_y = float('-inf')
+        max_z = float('-inf')
+
+        for tri in self.triangles:
+            tri_box = tri.bounding_box()
+            if tri_box is not None:
+                if tri_box.minimum.x < min_x: min_x = tri_box.minimum.x
+                if tri_box.minimum.y < min_y: min_y = tri_box.minimum.y
+                if tri_box.minimum.z < min_z: min_z = tri_box.minimum.z
+                if tri_box.maximum.x > max_x: max_x = tri_box.maximum.x
+                if tri_box.maximum.y > max_y: max_y = tri_box.maximum.y
+                if tri_box.maximum.z > max_z: max_z = tri_box.maximum.z
+
+        return AABB(
+            Vector3(min_x, min_y, min_z),
+            Vector3(max_x, max_y, max_z)
+        )
+
     def hit(self, ray: Ray, t_min: float, t_max: float) -> Optional[HitRecord]:
         closest_hit = None
         closest_t = t_max

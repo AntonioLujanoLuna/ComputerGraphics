@@ -4,9 +4,67 @@ from numba import cuda, float32
 import math
 from numba.cuda.random import xoroshiro128p_uniform_float32
 from .cuda_env import env_dir_to_uv
+import numpy as np
 
 INFINITY = 1e20
 EPSILON = 1e-8
+
+# Maximum number of precomputed Halton samples.
+MAX_HALTON_SAMPLES = 4096
+
+# -------------------------------------------------------------------------
+# Original Halton function (retained as a fallback)
+@cuda.jit(device=True)
+def halton(index, base):
+    """
+    Compute the Halton sequence value for a given index and base.
+    """
+    f = 1.0
+    r = 0.0
+    while index > 0:
+        f = f / base
+        r = r + f * (index % base)
+        index = index // base
+    return r
+
+# Increase the number of precomputed Halton tables by adding one for base 5.
+def halton_host(index, base):
+    f = 1.0
+    r = 0.0
+    while index > 0:
+        f /= base
+        r += f * (index % base)
+        index //= base
+    return r
+
+def precompute_halton_tables(max_samples):
+    table_base2 = np.empty(max_samples, dtype=np.float32)
+    table_base3 = np.empty(max_samples, dtype=np.float32)
+    table_base5 = np.empty(max_samples, dtype=np.float32)  # new table for base 5
+    for i in range(max_samples):
+        table_base2[i] = halton_host(i, 2)
+        table_base3[i] = halton_host(i, 3)
+        table_base5[i] = halton_host(i, 5)
+    return table_base2, table_base3, table_base5
+
+# Modify the halton_cached function to use the extra table.
+@cuda.jit(device=True)
+def halton_cached(index, base, halton_table_base2, halton_table_base3, halton_table_base5):
+    if index < MAX_HALTON_SAMPLES:
+        if base == 2:
+            return halton_table_base2[index]
+        elif base == 3:
+            return halton_table_base3[index]
+        elif base == 5:
+            return halton_table_base5[index]
+    # Fallback: compute on the fly.
+    f = 1.0
+    r = 0.0
+    while index > 0:
+        f /= base
+        r += f * (index % base)
+        index //= base
+    return r
 
 @cuda.jit(device=True)
 def get_random_dir(seed, out):
@@ -43,20 +101,6 @@ def cross_inplace(out, v1, v2):
     out[0] = temp0
     out[1] = temp1
     out[2] = temp2
-
-@cuda.jit(device=True)
-def halton(index, base):
-    """
-    Compute the Halton sequence value for a given index and base.
-    This is a simple low-discrepancy sequence generator.
-    """
-    f = 1.0
-    r = 0.0
-    while index > 0:
-        f = f / base
-        r = r + f * (index % base)
-        index = index // base
-    return r
 
 @cuda.jit(device=True)
 def random_in_unit_sphere(rng_states, thread_id, out):

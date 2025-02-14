@@ -42,6 +42,6 @@ class Sphere(Hittable):
         return rec
     
     def bounding_box(self) -> AABB:
-        # The bounding box of a sphere is simply its center ± radius.
+        # The bounding box of a sphere is center ± radius
         offset = Vector3(self.radius, self.radius, self.radius)
         return AABB(self.center - offset, self.center + offset)

@@ -126,3 +126,54 @@ def interpolate_uv(uv0, uv1, uv2, u: float, v: float, out_uv):
     w = 1.0 - u - v
     out_uv[0] = w * uv0[0] + u * uv1[0] + v * uv2[0]
     out_uv[1] = w * uv0[1] + u * uv1[1] + v * uv2[1]
+
+@cuda.jit(device=True)
+def aabb_hit(ray_origin, ray_dir, box_min, box_max, t_min, t_max):
+    for i in range(3):
+        invD = 1.0 / ray_dir[i]
+        t0 = (box_min[i] - ray_origin[i]) * invD
+        t1 = (box_max[i] - ray_origin[i]) * invD
+        if invD < 0.0:
+            temp = t0
+            t0 = t1
+            t1 = temp
+        t_min = t0 if t0 > t_min else t_min
+        t_max = t1 if t1 < t_max else t_max
+        if t_max <= t_min:
+            return False
+    return True
+
+@cuda.jit(device=True)
+def gpu_bvh_traverse(ray_origin, ray_dir,
+                     bbox_min, bbox_max,
+                     left_indices, right_indices,
+                     is_leaf, object_indices, num_nodes,
+                     t_min, t_max):
+    # Use a fixed-size local stack.
+    stack = cuda.local.array(64, dtype=cuda.int32)
+    stack_ptr = 0
+    hit_object = -1
+    hit_t = t_max
+    stack[stack_ptr] = 0  # start at root
+    stack_ptr += 1
+
+    while stack_ptr > 0:
+        stack_ptr -= 1
+        node_idx = stack[stack_ptr]
+        if not aabb_hit(ray_origin, ray_dir, bbox_min[node_idx], bbox_max[node_idx], t_min, hit_t):
+            continue
+        if is_leaf[node_idx] == 1:
+            # Here you would call your object-specific intersection function.
+            # For illustration we assume that a hit is recorded by updating hit_t and hit_object.
+            # (This is a placeholder; you must replace it with your actual object intersection.)
+            t = t_min * 0.99  # placeholder value
+            if t < hit_t:
+                hit_t = t
+                hit_object = object_indices[node_idx]
+        else:
+            stack[stack_ptr] = left_indices[node_idx]
+            stack_ptr += 1
+            stack[stack_ptr] = right_indices[node_idx]
+            stack_ptr += 1
+    return hit_object, hit_t
+
