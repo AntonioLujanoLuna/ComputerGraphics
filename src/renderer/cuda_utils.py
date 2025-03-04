@@ -6,11 +6,10 @@ from numba.cuda.random import xoroshiro128p_uniform_float32
 from .cuda_env import env_dir_to_uv
 import numpy as np
 
-INFINITY = 1e20
-EPSILON = 1e-8
-
-# Maximum number of precomputed Halton samples.
-MAX_HALTON_SAMPLES = 4096
+INFINITY = float32(1e20)
+EPSILON = float32(1e-8)
+MAX_BOUNCES = 16
+MAX_HALTON_SAMPLES = 1024  # Precompute this many samples for faster lookup
 
 # -------------------------------------------------------------------------
 # Original Halton function (retained as a fallback)
@@ -38,33 +37,38 @@ def halton_host(index, base):
     return r
 
 def precompute_halton_tables(max_samples):
-    table_base2 = np.empty(max_samples, dtype=np.float32)
-    table_base3 = np.empty(max_samples, dtype=np.float32)
-    table_base5 = np.empty(max_samples, dtype=np.float32)  # new table for base 5
+    """Precompute Halton sequence tables for the first few dimensions."""
+    
+    # Generate Halton sequences for bases 2, 3, and 5
+    halton_table_base2 = np.zeros(max_samples, dtype=np.float32)
+    halton_table_base3 = np.zeros(max_samples, dtype=np.float32)
+    halton_table_base5 = np.zeros(max_samples, dtype=np.float32)
+
     for i in range(max_samples):
-        table_base2[i] = halton_host(i, 2)
-        table_base3[i] = halton_host(i, 3)
-        table_base5[i] = halton_host(i, 5)
-    return table_base2, table_base3, table_base5
+        # Generate Halton sequences directly on CPU using host function - not device function
+        halton_table_base2[i] = halton_host(i, 2)
+        halton_table_base3[i] = halton_host(i, 3)
+        halton_table_base5[i] = halton_host(i, 5)
+    
+    return halton_table_base2, halton_table_base3, halton_table_base5
 
 # Modify the halton_cached function to use the extra table.
 @cuda.jit(device=True)
-def halton_cached(index, base, halton_table_base2, halton_table_base3, halton_table_base5):
-    if index < MAX_HALTON_SAMPLES:
-        if base == 2:
-            return halton_table_base2[index]
-        elif base == 3:
-            return halton_table_base3[index]
-        elif base == 5:
-            return halton_table_base5[index]
-    # Fallback: compute on the fly.
-    f = 1.0
-    r = 0.0
-    while index > 0:
-        f /= base
-        r += f * (index % base)
-        index //= base
-    return r
+def halton_cached(table, index):
+    """
+    Retrieve a precomputed Halton value from a table.
+    This is much faster than computing it on-the-fly.
+    
+    Args:
+        table: Precomputed Halton sequence table
+        index: Index into the table, should be < MAX_HALTON_SAMPLES
+    
+    Returns:
+        The Halton value at the given index
+    """
+    # Ensure we don't go out of bounds - wrap around if needed
+    idx = index % MAX_HALTON_SAMPLES
+    return table[idx]
 
 @cuda.jit(device=True)
 def get_random_dir(seed, out):

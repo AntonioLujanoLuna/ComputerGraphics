@@ -13,6 +13,7 @@ from renderer.env_importance import build_env_cdf
 from core.uv import UV
 from .env_map_utils import generate_gradient_env_map
 from renderer.cuda_utils import MAX_HALTON_SAMPLES, precompute_halton_tables
+from .tone_mapping import reinhard_tone_mapping
 
 # CUDA device constants
 INFINITY = float32(1e20)
@@ -103,6 +104,14 @@ class Renderer:
         self.d_frame_output = cuda.to_device(np.zeros((width, height, 3), dtype=np.float32))
         self.frame_output = cuda.pinned_array((width, height, 3), dtype=np.float32)
 
+        # Initialize depth buffer
+        self.d_depth_buffer = cuda.to_device(np.ones((width, height), dtype=np.float32) * 1e20)
+        
+        # Initialize previous frame buffers for temporal reprojection
+        self.d_prev_accum = cuda.to_device(np.zeros((width, height, 3), dtype=np.float32))
+        self.d_prev_sample_count = cuda.to_device(np.zeros((width, height), dtype=np.int32))
+        self.d_prev_depth = cuda.to_device(np.ones((width, height), dtype=np.float32) * 1e20)
+        
         # These BVH attributes should be explicitly initialized too
         self.d_bvh_bbox_min = None
         self.d_bvh_bbox_max = None
@@ -395,74 +404,60 @@ class Renderer:
         
         # Ensure all objects have a gpu_index attribute before building the BVH
         for i, obj in enumerate(world.objects):
-            if not hasattr(obj, 'gpu_index'):
-                print(f"WARNING: Object {i} has no gpu_index, assigning one")
+            if not hasattr(obj, 'gpu_index') or obj.gpu_index < 0:
+                print(f"Setting GPU index for object {i}")
                 if hasattr(obj, 'radius'):
                     # It's a sphere
-                    sphere_idx = next((j for j, s in enumerate(sphere_objects) if s is obj), -1)
-                    obj.gpu_index = sphere_idx
-                elif hasattr(obj, 'triangles'):
-                    # It's a mesh
-                    mesh_idx = next((j for j, m in enumerate(mesh_objects) if m is obj), -1)
-                    if mesh_idx >= 0:
-                        obj.gpu_index = len(sphere_objects) + sum(len(mesh_objects[k].triangles) for k in range(mesh_idx))
+                    # Find the object in sphere_objects by comparing object identity, not just type
+                    sphere_idx = -1
+                    for j, s in enumerate(sphere_objects):
+                        if s is obj:  # Use identity comparison (is) instead of equality (==)
+                            sphere_idx = j
+                            break
+                    
+                    # Only assign if we found a valid index
+                    if sphere_idx >= 0:
+                        obj.gpu_index = sphere_idx
+                        print(f"  Assigned sphere index {sphere_idx} to object {i}")
                     else:
                         obj.gpu_index = -1
+                        print(f"  WARNING: Could not find matching sphere for object {i}")
+                        
+                elif hasattr(obj, 'triangles'):
+                    # It's a mesh
+                    mesh_idx = -1
+                    for j, m in enumerate(mesh_objects):
+                        if m is obj:  # Use identity comparison
+                            mesh_idx = j
+                            break
+                    
+                    if mesh_idx >= 0:
+                        # Calculate correct base index for the first triangle of this mesh
+                        base_idx = len(sphere_objects)
+                        for k in range(mesh_idx):
+                            base_idx += len(mesh_objects[k].triangles)
+                        
+                        obj.gpu_index = base_idx
+                        print(f"  Assigned mesh base index {base_idx} to object {i} with {len(obj.triangles)} triangles")
+                        
+                        # Also assign indices to individual triangles
+                        for t_idx, triangle in enumerate(obj.triangles):
+                            triangle.gpu_index = base_idx + t_idx
+                    else:
+                        obj.gpu_index = -1
+                        print(f"  WARNING: Could not find matching mesh for object {i}")
                 else:
                     obj.gpu_index = -1
-                    
-        world.build_bvh()
-        print(f"  BVH built successfully: {world.bvh_root is not None}")
-
-        # Process texture data
-        textures = set()
-        for obj in world.objects:
-            if hasattr(obj, 'material') and hasattr(obj.material, 'texture'):
-                textures.add(obj.material.texture)
+                    print(f"  WARNING: Unknown object type for object {i}")
         
-        # Ensure we have at least a default texture
-        if not textures:
-            print("No textures found, creating default texture")
-            default_texture_data = np.array([0.5, 0.5, 0.5], dtype=np.float32)  # Default gray
-            self.d_texture_data = cuda.to_device(default_texture_data)
-            self.texture_dimensions = cuda.to_device(np.array([[1, 1]], dtype=np.int32))
-            self.d_texture_indices = cuda.to_device(np.zeros(1, dtype=np.int32))
+        # Verify all objects have valid GPU indices
+        invalid_indices = [i for i, obj in enumerate(world.objects) if not hasattr(obj, 'gpu_index') or obj.gpu_index < 0]
+        if invalid_indices:
+            print(f"  WARNING: {len(invalid_indices)} objects still have invalid GPU indices: {invalid_indices}")
         else:
-            self.load_textures(list(textures))
+            print(f"  All {len(world.objects)} objects have valid GPU indices")
             
-            # Ensure texture indices is initialized
-            if not hasattr(self, 'd_texture_indices') or self.d_texture_indices is None:
-                print("Initializing texture indices")
-                num_objects = len(sphere_objects) + triangle_count
-                self.d_texture_indices = cuda.to_device(np.zeros(num_objects, dtype=np.int32))
-
-        # Allocate adaptive sampling buffers
-        self.d_accum_buffer = cuda.to_device(np.zeros((self.width, self.height, 3), dtype=np.float32))
-        self.d_accum_buffer_sq = cuda.to_device(np.zeros((self.width, self.height, 3), dtype=np.float32))
-        self.d_sample_count = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32))
-        self.d_mask = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32))
-
-        # Build the BVH over the world objects
-        print(f"Building BVH for {len(world.objects)} objects...")
-        
-        # Ensure all objects have a gpu_index attribute before building the BVH
-        for i, obj in enumerate(world.objects):
-            if not hasattr(obj, 'gpu_index'):
-                print(f"WARNING: Object {i} has no gpu_index, assigning one")
-                if hasattr(obj, 'radius'):
-                    # It's a sphere
-                    sphere_idx = next((j for j, s in enumerate(sphere_objects) if s is obj), -1)
-                    obj.gpu_index = sphere_idx
-                elif hasattr(obj, 'triangles'):
-                    # It's a mesh
-                    mesh_idx = next((j for j, m in enumerate(mesh_objects) if m is obj), -1)
-                    if mesh_idx >= 0:
-                        obj.gpu_index = len(sphere_objects) + sum(len(mesh_objects[k].triangles) for k in range(mesh_idx))
-                    else:
-                        obj.gpu_index = -1
-                else:
-                    obj.gpu_index = -1
-                    
+        # Build the BVH after assigning all GPU indices
         world.build_bvh()
         print(f"  BVH built successfully: {world.bvh_root is not None}")
 
@@ -510,286 +505,247 @@ class Renderer:
 
     def render_frame_adaptive(self, camera, world) -> np.ndarray:
         """
-        Render a frame with adaptive sampling, BVH acceleration, and temporal reprojection.
+        Renders a frame using adaptive sampling based on temporal reprojection and variance analysis.
         
-        This method:
-        1. Prepares camera and scene parameters for GPU rendering
-        2. Performs temporal reprojection to reuse data from previous frames
-        3. Launches the adaptive rendering kernel with BVH acceleration
-        4. Computes a convergence mask to focus computation on noisy areas
-        5. Updates history buffers for the next frame
-        
-        Parameters:
-            camera: Camera object with position, orientation, and projection parameters
-            world: Scene containing objects to render
-            
-        Returns:
-            np.ndarray: Rendered image of shape (width, height, 3) with float32 values
+        This version adaptively samples pixels with high variance, and reuses pixel data 
+        from the previous frame through temporal reprojection when the camera motion is small.
         """
-        # Create CUDA stream for asynchronous operations
-        stream = cuda.stream()
-
-        # Check world data to diagnose why we might not be seeing objects
-        sphere_count = sum(1 for obj in world.objects if hasattr(obj, 'radius'))
-        mesh_objects = [obj for obj in world.objects if hasattr(obj, 'triangles')]
-        triangle_count = sum(len(mesh.triangles) for mesh in mesh_objects)
+        # Update frame count
+        self.frame_number += 1
         
-        print(f"\n=== Rendering Frame {self.frame_number} ===")
-        print(f"Scene contains {len(world.objects)} objects: {sphere_count} spheres, {len(mesh_objects)} meshes with {triangle_count} triangles")
-        print(f"Camera position: ({camera.position.x}, {camera.position.y}, {camera.position.z})")
-        print(f"Camera direction: ({camera.forward.x}, {camera.forward.y}, {camera.forward.z})")
+        # Store camera parameters for temporal reprojection
+        camera_origin_host = np.array([camera.position.x, camera.position.y, camera.position.z], dtype=np.float32)
         
-        # More specific check for scene data initialization with better diagnostics
-        scene_init_needed = False
-        if not hasattr(self, 'd_sphere_centers') or self.d_sphere_centers is None:
-            print(f"Scene data missing: d_sphere_centers")
-            scene_init_needed = True
-        elif not hasattr(self, 'd_sphere_roughness') or self.d_sphere_roughness is None:
-            print(f"Scene data missing: d_sphere_roughness")
-            scene_init_needed = True
+        # ---- Performance optimization: Cache last frame's camera state in class variables ----
+        if not hasattr(self, 'prev_camera_origin_host'):
+            self.prev_camera_origin_host = np.zeros(3, dtype=np.float32)
+            self.prev_camera_forward_host = np.zeros(3, dtype=np.float32)
         
-        if scene_init_needed:
-            print(f"Reinitializing scene with {len(world.objects)} objects ({sphere_count} spheres, {triangle_count} triangles)")
-            self.update_scene_data(world)
-            # After update, verify we have the data
-            if not hasattr(self, 'd_sphere_centers') or self.d_sphere_centers is None:
-                print("ERROR: d_sphere_centers still missing after scene update!")
-            if not hasattr(self, 'd_sphere_roughness') or self.d_sphere_roughness is None:
-                print("ERROR: d_sphere_roughness still missing after scene update!")
-
-        # Set up current camera parameters
-        camera_origin = np.array(
-            [camera.position.x, camera.position.y, camera.position.z],
-            dtype=np.float32
-        )
-        camera_lower_left = np.array(
-            [camera.lower_left_corner.x, camera.lower_left_corner.y, camera.lower_left_corner.z],
-            dtype=np.float32
-        )
-        camera_horizontal = np.array(
-            [camera.horizontal.x, camera.horizontal.y, camera.horizontal.z],
-            dtype=np.float32
-        )
-        camera_vertical = np.array(
-            [camera.vertical.x, camera.vertical.y, camera.vertical.z],
-            dtype=np.float32
-        )
-        camera_forward = np.array(
-            [camera.forward.x, camera.forward.y, camera.forward.z],
-            dtype=np.float32
-        )
-        camera_right = np.array(
-            [camera.right.x, camera.right.y, camera.right.z],
-            dtype=np.float32
-        )
-        camera_up = np.array(
-            [camera.up.x, camera.up.y, camera.up.z],
-            dtype=np.float32
-        )
-        curr_focus = camera.focus_dist
-
-        # Initialize camera buffers if they don't exist
-        if not hasattr(self, 'd_camera_origin') or self.d_camera_origin is None:
-            self.d_camera_origin = cuda.to_device(np.zeros(3, dtype=np.float32))
-            self.d_camera_lower_left = cuda.to_device(np.zeros(3, dtype=np.float32))
-            self.d_camera_horizontal = cuda.to_device(np.zeros(3, dtype=np.float32))
-            self.d_camera_vertical = cuda.to_device(np.zeros(3, dtype=np.float32))
-            self.d_camera_forward = cuda.to_device(np.zeros(3, dtype=np.float32))
-            self.d_camera_right = cuda.to_device(np.zeros(3, dtype=np.float32))
-            self.d_camera_up = cuda.to_device(np.zeros(3, dtype=np.float32))
-            self.d_curr_focus = cuda.to_device(np.zeros(1, dtype=np.float32))
-            self.d_frame_output = cuda.to_device(np.zeros((self.width, self.height, 3), dtype=np.float32))
-            self.frame_output = cuda.pinned_array((self.width, self.height, 3), dtype=np.float32)
-
-        # Transfer camera parameters to pre-allocated device memory
-        cuda.to_device(camera_origin, to=self.d_camera_origin, stream=stream)
-        cuda.to_device(camera_lower_left, to=self.d_camera_lower_left, stream=stream)
-        cuda.to_device(camera_horizontal, to=self.d_camera_horizontal, stream=stream)
-        cuda.to_device(camera_vertical, to=self.d_camera_vertical, stream=stream)
-        cuda.to_device(camera_forward, to=self.d_camera_forward, stream=stream)
-        cuda.to_device(camera_right, to=self.d_camera_right, stream=stream)
-        cuda.to_device(camera_up, to=self.d_camera_up, stream=stream)
-        cuda.to_device(np.array([curr_focus], dtype=np.float32), to=self.d_curr_focus, stream=stream)
+        # ---- Reuse arrays rather than allocating new ones each frame ----
+        camera_motion = False
+        camera_forward_host = np.array([camera.forward.x, camera.forward.y, camera.forward.z], dtype=np.float32)
         
-        # Ensure depth buffer is allocated
-        if not hasattr(self, 'd_prev_depth') or self.d_prev_depth is None:
-            host_depth = np.zeros((self.width, self.height), dtype=np.float32)
-            self.d_prev_depth = cuda.to_device(host_depth, stream=stream)
-
-        # Check if adaptive sampling buffers exist
-        if not hasattr(self, 'd_accum_buffer') or self.d_accum_buffer is None:
+        # Calculate camera motion - check both position and orientation changes
+        camera_origin_diff = np.linalg.norm(camera_origin_host - self.prev_camera_origin_host)
+        forward_diff = np.linalg.norm(camera_forward_host - self.prev_camera_forward_host)
+        
+        # Detect any significant change in camera position or orientation
+        position_changed = camera_origin_diff > 0.0001  # Position threshold
+        rotation_changed = forward_diff > 0.0001        # Rotation threshold
+        camera_motion = position_changed or rotation_changed
+        
+        # Only print debug info occasionally to reduce CPU overhead
+        if self.frame_number % 60 == 0:
+            print(f"Movement: sqrt({camera_origin_diff**2:.6f}) = {camera_origin_diff:.6f}, rotation: {forward_diff:.6f}, threshold: 0.05")
+        
+        if camera_motion and rotation_changed and self.frame_number % 10 == 0:
+            print(f"Resetting accumulation due to rotation: {forward_diff:.6f} > 0.0001")
+        elif camera_motion and position_changed and self.frame_number % 10 == 0:
+            print(f"Resetting accumulation due to movement: {camera_origin_diff:.6f} > 0.0001")
+        
+        # Store current camera parameters for next frame's comparison
+        np.copyto(self.prev_camera_forward_host, camera_forward_host)
+        np.copyto(self.prev_camera_origin_host, camera_origin_host)
+        
+        # ---- Minimize host-device transfers ----
+        # Calculate viewport corners and upload to device in a single batch if possible
+        if not hasattr(self, 'camera_params_host'):
+            # First-time allocation
+            self.camera_params_host = np.zeros((4, 3), dtype=np.float32)  # [origin, lower_left, horizontal, vertical]
+        
+        # Fill the host array
+        self.camera_params_host[0, :] = camera_origin_host  
+        self.camera_params_host[1, :] = [camera.lower_left_corner.x, camera.lower_left_corner.y, camera.lower_left_corner.z]
+        self.camera_params_host[2, :] = [camera.horizontal.x, camera.horizontal.y, camera.horizontal.z]
+        self.camera_params_host[3, :] = [camera.vertical.x, camera.vertical.y, camera.vertical.z]
+        
+        # Transfer to device (only the used parts)
+        self.d_camera_origin.copy_to_device(self.camera_params_host[0])
+        self.d_camera_lower_left.copy_to_device(self.camera_params_host[1])
+        self.d_camera_horizontal.copy_to_device(self.camera_params_host[2])
+        self.d_camera_vertical.copy_to_device(self.camera_params_host[3])
+        
+        # Similarly batch camera orientation vectors together
+        if not hasattr(self, 'camera_orientation_host'):
+            self.camera_orientation_host = np.zeros((3, 3), dtype=np.float32)  # [forward, right, up]
+        
+        self.camera_orientation_host[0, :] = camera_forward_host
+        self.camera_orientation_host[1, :] = [camera.right.x, camera.right.y, camera.right.z]
+        self.camera_orientation_host[2, :] = [camera.up.x, camera.up.y, camera.up.z]
+        
+        self.d_camera_forward.copy_to_device(self.camera_orientation_host[0])
+        self.d_camera_right.copy_to_device(self.camera_orientation_host[1]) 
+        self.d_camera_up.copy_to_device(self.camera_orientation_host[2])
+        
+        # Set current focus distance
+        curr_focus_host = np.array([camera.focus_dist], dtype=np.float32)
+        self.d_curr_focus.copy_to_device(curr_focus_host)
+        
+        # Initialize buffers if they don't exist
+        if self.d_mask is None:
+            self.d_mask = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32))
+        
+        if self.d_accum_buffer is None:
+            # If buffers don't exist, create them
             self.d_accum_buffer = cuda.to_device(np.zeros((self.width, self.height, 3), dtype=np.float32))
             self.d_accum_buffer_sq = cuda.to_device(np.zeros((self.width, self.height, 3), dtype=np.float32))
             self.d_sample_count = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32))
             self.d_mask = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32))
-
-        # Allocate current frame's depth buffer
-        d_depth_buffer = cuda.to_device(np.zeros((self.width, self.height), dtype=np.float32), stream=stream)
-
-        # Reset output buffer - no need to reallocate
-        self.d_frame_output.copy_to_device(np.zeros((self.width, self.height, 3), dtype=np.float32), stream=stream)
-
-        # --- Temporal Reprojection Step ---
-        # If we have a previous frame and camera parameters, reproject data
-        if self.frame_number > 0 and self.prev_camera_origin is not None:
-            d_prev_cam_origin = cuda.to_device(self.prev_camera_origin, stream=stream)
-            d_prev_cam_lower_left = cuda.to_device(self.prev_camera_lower_left, stream=stream)
-            d_prev_cam_horizontal = cuda.to_device(self.prev_camera_horizontal, stream=stream)
-            d_prev_cam_vertical = cuda.to_device(self.prev_camera_vertical, stream=stream)
-            d_prev_cam_forward = cuda.to_device(self.prev_camera_forward, stream=stream)
-            d_prev_cam_right = cuda.to_device(self.prev_camera_right, stream=stream)
-            d_prev_cam_up = cuda.to_device(self.prev_camera_up, stream=stream)
-            d_prev_focus = cuda.to_device(np.array([self.prev_focus], dtype=np.float32), stream=stream)
-
-            # Allocate temporary buffers for the blended accumulation and sample count
-            temp_accum = cuda.to_device(np.zeros((self.width, self.height, 3), dtype=np.float32), stream=stream)
-            temp_sample_count = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32), stream=stream)
-
-            # Launch temporal reprojection kernel
-            temporal_reprojection_kernel[self.blockspergrid, self.threadsperblock, stream](
-                self.width, self.height,
-                self.d_prev_accum, self.d_prev_sample_count, self.d_prev_depth,
-                d_prev_cam_origin, d_prev_cam_lower_left, d_prev_cam_horizontal, d_prev_cam_vertical,
-                d_prev_cam_forward, d_prev_cam_right, d_prev_cam_up, d_prev_focus[0],
-                self.d_camera_origin, self.d_camera_lower_left, self.d_camera_horizontal, self.d_camera_vertical,
-                self.d_camera_forward, self.d_camera_right, self.d_camera_up, self.d_curr_focus[0],
-                temp_accum, temp_sample_count
-            )
-            stream.synchronize()
-            
-            # Replace current accumulation buffers with reprojected ones
-            self.d_accum_buffer = temp_accum
-            self.d_sample_count = temp_sample_count
-
-        # --- Determine BVH parameters ---
-        # Get BVH node count if available
-        num_nodes = 0
-        has_bvh = False
-        if hasattr(self, 'd_bvh_bbox_min') and self.d_bvh_bbox_min is not None:
-            num_nodes = self.d_bvh_bbox_min.shape[0]
-            has_bvh = True
-            print(f"Using BVH with {num_nodes} nodes for acceleration")
-        else:
-            print("WARNING: No BVH data available for acceleration")
-
-        # Check for any None values in the parameters
-        print("Checking for None values in parameters:")
-        if self.d_sphere_centers is None: print("d_sphere_centers is None")
-        if self.d_sphere_radii is None: print("d_sphere_radii is None")
-        if self.d_sphere_materials is None: print("d_sphere_materials is None")
-        if self.d_sphere_material_types is None: print("d_sphere_material_types is None")
-        if self.d_sphere_roughness is None: print("d_sphere_roughness is None")
-        if self.d_triangle_vertices is None: print("d_triangle_vertices is None")
-        if self.d_triangle_uvs is None: print("d_triangle_uvs is None")
-        if self.d_triangle_materials is None: print("d_triangle_materials is None")
-        if self.d_triangle_material_types is None: print("d_triangle_material_types is None")
-        if self.d_triangle_roughness is None: print("d_triangle_roughness is None")
-        if self.d_texture_data is None: print("d_texture_data is None")
-        if self.texture_dimensions is None: print("texture_dimensions is None")
-        if self.d_texture_indices is None: print("d_texture_indices is None")
-        if self.d_accum_buffer is None: print("d_accum_buffer is None")
-        if self.d_accum_buffer_sq is None: print("d_accum_buffer_sq is None")
-        if self.d_sample_count is None: print("d_sample_count is None")
-        if self.d_mask is None: print("d_mask is None")
-        if self.d_frame_output is None: print("d_frame_output is None")
-        if d_depth_buffer is None: print("d_depth_buffer is None")
-        if self.rng_states is None: print("rng_states is None")
-        if self.d_env_map is None: print("d_env_map is None")
-        if self.d_env_cdf is None: print("d_env_cdf is None")
-        if self.d_halton_table_base2 is None: print("d_halton_table_base2 is None")
-        if self.d_halton_table_base3 is None: print("d_halton_table_base3 is None")
-        if self.d_halton_table_base5 is None: print("d_halton_table_base5 is None")
         
-        # --- Launch Adaptive Render Kernel ---
-        # Create empty arrays if BVH is not available to avoid passing None to CUDA
-        if not has_bvh:
-            empty_array_3d = cuda.to_device(np.zeros((1, 3), dtype=np.float32))
-            empty_array_1d = cuda.to_device(np.zeros(1, dtype=np.int32))
+        # Only initialize depth buffer for first frame or after reset
+        if self.d_depth_buffer is None:
+            self.d_depth_buffer = cuda.to_device(np.ones((self.width, self.height), dtype=np.float32) * 1e20)
             
-            # Initialize texture indices if it's None
-            if not hasattr(self, 'd_texture_indices') or self.d_texture_indices is None:
-                print("Creating empty texture indices array")
-                self.d_texture_indices = cuda.to_device(np.zeros(1, dtype=np.int32))
-            
-            adaptive_render_kernel[self.blockspergrid, self.threadsperblock, stream](
-                self.width, self.height,
-                self.d_camera_origin, self.d_camera_lower_left,
-                self.d_camera_horizontal, self.d_camera_vertical,
-                self.d_sphere_centers, self.d_sphere_radii, 
-                self.d_sphere_materials, self.d_sphere_material_types,
-                self.d_sphere_roughness,  
-                self.d_triangle_vertices, self.d_triangle_uvs, 
-                self.d_triangle_materials, self.d_triangle_material_types,
-                self.d_triangle_roughness, 
-                self.d_texture_data, self.texture_dimensions, self.d_texture_indices,
-                self.d_accum_buffer, self.d_accum_buffer_sq, 
-                self.d_sample_count, self.d_mask, self.d_frame_output, d_depth_buffer,
-                self.frame_number, self.rng_states, self.N,
-                self.d_env_map, self.d_env_cdf, self.env_total, self.env_width, self.env_height,
-                self.d_halton_table_base2, self.d_halton_table_base3, self.d_halton_table_base5,
-                empty_array_3d, empty_array_3d, empty_array_1d, empty_array_1d, empty_array_1d, empty_array_1d, 0
-            )
+        # Allocate buffers for temporal reprojection
+        if self.d_prev_accum is None:
+            self.d_prev_accum = cuda.to_device(np.zeros((self.width, self.height, 3), dtype=np.float32))
+            self.d_prev_sample_count = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32))
+            self.d_prev_depth = cuda.to_device(np.ones((self.width, self.height), dtype=np.float32) * 1e20)
+        
+        # Swap for next frame
+        # Store current camera parameters for next frame's reprojection
+        if self.prev_camera_origin is None:
+            self.prev_camera_origin = cuda.to_device(camera_origin_host)
+            self.prev_camera_forward = cuda.to_device(camera_forward_host)
+            self.prev_camera_right = cuda.to_device(self.camera_orientation_host[1])
+            self.prev_camera_up = cuda.to_device(self.camera_orientation_host[2])
+            self.prev_focus = cuda.to_device(curr_focus_host)
         else:
-            # Initialize texture indices if it's None
-            if not hasattr(self, 'd_texture_indices') or self.d_texture_indices is None:
-                print("Creating empty texture indices array")
-                self.d_texture_indices = cuda.to_device(np.zeros(1, dtype=np.int32))
+            # Update only when camera actually moved to avoid unnecessary transfers
+            if camera_motion:
+                self.prev_camera_origin.copy_to_device(camera_origin_host)
+                self.prev_camera_forward.copy_to_device(camera_forward_host)
+                self.prev_camera_right.copy_to_device(self.camera_orientation_host[1])
+                self.prev_camera_up.copy_to_device(self.camera_orientation_host[2])
+                self.prev_focus.copy_to_device(curr_focus_host)
+        
+        # ---- Optimize buffer management ----
+        # Swap pointers to avoid data copying
+        if self.frame_number > 1:
+            # Swap pointers to avoid data copying
+            self.d_prev_accum, self.d_accum_buffer = self.d_accum_buffer, self.d_prev_accum
+            self.d_prev_sample_count, self.d_sample_count = self.d_sample_count, self.d_prev_sample_count
+            self.d_prev_depth, self.d_depth_buffer = self.d_depth_buffer, self.d_prev_depth
+            
+            # Clear accumulation buffers for current frame - only if camera moved
+            if camera_motion:
+                # Use CUDA kernels to clear buffers directly on GPU - much faster than transferring from host
+                # These operations can be streamed for parallelism
                 
-            adaptive_render_kernel[self.blockspergrid, self.threadsperblock, stream](
+                # Define a generic kernel to clear arrays
+                threads_per_block = (16, 16)
+                blocks_per_grid_x = (self.width + threads_per_block[0] - 1) // threads_per_block[0]
+                blocks_per_grid_y = (self.height + threads_per_block[1] - 1) // threads_per_block[1]
+                
+                # Create and launch kernels to clear buffers
+                @cuda.jit
+                def clear_float_buffer(d_buffer, value):
+                    x, y = cuda.grid(2)
+                    if x < d_buffer.shape[0] and y < d_buffer.shape[1]:
+                        for c in range(d_buffer.shape[2]):
+                            d_buffer[x, y, c] = value
+                
+                @cuda.jit
+                def clear_int_buffer(d_buffer, value):
+                    x, y = cuda.grid(2)
+                    if x < d_buffer.shape[0] and y < d_buffer.shape[1]:
+                        d_buffer[x, y] = value
+                
+                @cuda.jit
+                def reset_depth_buffer(d_depth, far_value):
+                    x, y = cuda.grid(2)
+                    if x < d_depth.shape[0] and y < d_depth.shape[1]:
+                        d_depth[x, y] = far_value
+                
+                # Clear all buffers
+                clear_float_buffer[(blocks_per_grid_x, blocks_per_grid_y), threads_per_block](
+                    self.d_accum_buffer, 0.0
+                )
+                clear_float_buffer[(blocks_per_grid_x, blocks_per_grid_y), threads_per_block](
+                    self.d_accum_buffer_sq, 0.0
+                )
+                clear_int_buffer[(blocks_per_grid_x, blocks_per_grid_y), threads_per_block](
+                    self.d_sample_count, 0
+                )
+                reset_depth_buffer[(blocks_per_grid_x, blocks_per_grid_y), threads_per_block](
+                    self.d_depth_buffer, 1e20
+                )
+                clear_int_buffer[(blocks_per_grid_x, blocks_per_grid_y), threads_per_block](
+                    self.d_mask, 0
+                )
+        
+        # Compute variance and create adaptive sampling mask
+        # Only update the mask every few frames to amortize cost
+        if self.frame_number % 4 == 0:
+            compute_variance_mask_kernel[self.blockspergrid, self.threadsperblock](
+                self.d_accum_buffer, self.d_accum_buffer_sq,
+                self.d_sample_count, self.d_mask,
+                0.005,  # variance threshold - lower means more refinement
+                10      # min samples before checking convergence
+            )
+        
+        # BVH acceleration structure parameters
+        num_nodes = 0
+        
+        if hasattr(world, 'bvh') and world.bvh is not None:
+            num_nodes = world.bvh.num_nodes
+        
+        # ---- Optimize kernel launch strategy ----
+        # Process samples in batches to keep kernel execution time reasonable
+        # Use smaller batch sizes when quality is higher to prevent CUDA timeouts
+        batch_size = 4  # Starting batch size
+        if self.N > 8:
+            batch_size = 2  # Smaller batch size for higher quality settings to avoid timeouts
+        
+        # Store streams for asynchronous execution
+        if not hasattr(self, 'cuda_streams'):
+            self.cuda_streams = [cuda.stream() for _ in range(2)]
+        
+        # Launch the adaptive rendering kernel in batches with stream synchronization
+        for batch_start in range(0, self.N, batch_size):
+            batch_end = min(batch_start + batch_size, self.N)
+            batch_samples = batch_end - batch_start
+            
+            # Alternate between streams for overlapped execution
+            stream_idx = (batch_start // batch_size) % len(self.cuda_streams)
+            
+            # Call the kernel with the current batch and explicitly name the BVH parameters
+            adaptive_render_kernel[self.blockspergrid, self.threadsperblock, self.cuda_streams[stream_idx]](
                 self.width, self.height,
                 self.d_camera_origin, self.d_camera_lower_left,
                 self.d_camera_horizontal, self.d_camera_vertical,
-                self.d_sphere_centers, self.d_sphere_radii, 
-                self.d_sphere_materials, self.d_sphere_material_types,
-                self.d_sphere_roughness,  
-                self.d_triangle_vertices, self.d_triangle_uvs, 
-                self.d_triangle_materials, self.d_triangle_material_types,
-                self.d_triangle_roughness, 
+                self.d_sphere_centers, self.d_sphere_radii,
+                self.d_sphere_materials, self.d_sphere_material_types, self.d_sphere_roughness,
+                self.d_triangle_vertices, self.d_triangle_uvs,
+                self.d_triangle_materials, self.d_triangle_material_types, self.d_triangle_roughness,
                 self.d_texture_data, self.texture_dimensions, self.d_texture_indices,
-                self.d_accum_buffer, self.d_accum_buffer_sq, 
-                self.d_sample_count, self.d_mask, self.d_frame_output, d_depth_buffer,
-                self.frame_number, self.rng_states, self.N,
+                self.d_accum_buffer, self.d_accum_buffer_sq,
+                self.d_sample_count, self.d_mask, self.d_frame_output, self.d_depth_buffer,
+                self.frame_number + batch_start, self.rng_states, batch_samples,
                 self.d_env_map, self.d_env_cdf, self.env_total, self.env_width, self.env_height,
                 self.d_halton_table_base2, self.d_halton_table_base3, self.d_halton_table_base5,
-                self.d_bvh_bbox_min, self.d_bvh_bbox_max, self.d_bvh_left, self.d_bvh_right, 
-                self.d_bvh_is_leaf, self.d_bvh_object_indices, num_nodes
+                self.d_bvh_bbox_min if hasattr(self, 'd_bvh_bbox_min') and self.d_bvh_bbox_min is not None else None,
+                self.d_bvh_bbox_max if hasattr(self, 'd_bvh_bbox_max') and self.d_bvh_bbox_max is not None else None,
+                self.d_bvh_left if hasattr(self, 'd_bvh_left') and self.d_bvh_left is not None else None,
+                self.d_bvh_right if hasattr(self, 'd_bvh_right') and self.d_bvh_right is not None else None,
+                self.d_bvh_is_leaf if hasattr(self, 'd_bvh_is_leaf') and self.d_bvh_is_leaf is not None else None,
+                self.d_bvh_object_indices if hasattr(self, 'd_bvh_object_indices') and self.d_bvh_object_indices is not None else None,
+                num_nodes
             )
         
-        # --- Update Convergence Mask ---
-        # Every 8 frames, update which pixels have converged
-        if self.frame_number % 8 == 0:
-            compute_variance_mask_kernel[self.blockspergrid, self.threadsperblock, stream](
-                self.d_accum_buffer, self.d_accum_buffer_sq, 
-                self.d_sample_count, self.d_mask, 
-                0.001,  # Variance threshold
-                32      # Minimum samples before considering convergence
-            )
+        # Synchronize all streams before proceeding
+        cuda.synchronize()
         
-        stream.synchronize()
-
-        # Copy the result to host memory
-        self.d_frame_output.copy_to_host(self.frame_output, stream=stream)
-        stream.synchronize()
+        # Asynchronously copy the frame output to host memory
+        self.d_frame_output.copy_to_host(self.frame_output)
         
-        # Increment frame counter
-        self.frame_number += 1
-
-        # --- Update Previous Frame Data for Next Reprojection ---
-        self.prev_camera_origin = camera_origin.copy()
-        self.prev_camera_lower_left = camera_lower_left.copy()
-        self.prev_camera_horizontal = camera_horizontal.copy()
-        self.prev_camera_vertical = camera_vertical.copy()
-        self.prev_camera_forward = camera_forward.copy()
-        self.prev_camera_right = camera_right.copy()
-        self.prev_camera_up = camera_up.copy()
-        self.prev_focus = curr_focus
-
-        # Store current state for next frame's temporal reprojection
-        self.d_prev_accum = self.d_accum_buffer
-        self.d_prev_sample_count = self.d_sample_count
-        self.d_prev_depth = d_depth_buffer
-
-        return self.frame_output
+        # Apply tone mapping to the frame
+        tone_mapped = reinhard_tone_mapping(self.frame_output)
+        
+        # Increment sample count
+        self.samples += self.N
+        
+        return tone_mapped
 
     def reset_accumulation(self):
         """Reset all accumulation buffers (current and previous) when the scene or camera changes."""

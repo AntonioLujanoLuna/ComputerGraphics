@@ -16,6 +16,7 @@ from .cuda_materials import compute_direct_light
 INFINITY = 1e20
 EPSILON = 1e-20
 MAX_BOUNCES = 16
+MAX_HALTON_SAMPLES = 1024  # Must match the value in cuda_utils.py
 
 @cuda.jit
 def adaptive_render_kernel(width, height,
@@ -35,99 +36,67 @@ def adaptive_render_kernel(width, height,
                            is_leaf=None, object_indices=None, num_nodes=0):
     """
     CUDA kernel for adaptive path tracing with BVH acceleration and temporal reprojection support.
-    
-    This kernel:
-    1. Skips already converged pixels (d_mask[x,y]==1)
-    2. Traces multiple samples per pixel with stratified sampling
-    3. Accumulates color and variance for adaptive sampling
-    4. Stores depth values for temporal reprojection
-    5. Uses BVH acceleration structure when available
-    
-    Parameters:
-        width, height (int): Image dimensions
-        camera_origin (float32[3]): Camera position
-        camera_lower_left (float32[3]): Lower left corner of camera viewport
-        camera_horizontal (float32[3]): Horizontal span of camera viewport
-        camera_vertical (float32[3]): Vertical span of camera viewport
-        sphere_centers, sphere_radii, sphere_materials, sphere_material_types: Scene sphere data
-        triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types: Scene triangle data
-        texture_data, texture_dimensions, texture_indices: Texture information
-        d_accum_buffer (float32[width,height,3]): Accumulated color buffer
-        d_accum_buffer_sq (float32[width,height,3]): Accumulated squared color buffer (for variance)
-        d_sample_count (int32[width,height]): Sample count per pixel
-        d_mask (int32[width,height]): Convergence mask (1=converged)
-        d_frame_output (float32[width,height,3]): Output color buffer
-        d_depth_buffer (float32[width,height]): Output depth buffer for temporal reprojection
-        frame_number (int): Current frame number
-        rng_states: CUDA random number generator states
-        N (int): Number of samples per pixel for this frame
-        d_env_map, d_env_cdf, env_total, env_width, env_height: Environment map data
-        d_halton_table_base2, d_halton_table_base3, d_halton_table_base5: Precomputed Halton sequences
-        bbox_min, bbox_max, left_indices, right_indices, is_leaf, object_indices, num_nodes: BVH data
     """
+    # Get thread indices
     x, y = cuda.grid(2)
+    
+    # Boundary check - early exit if out of bounds to reduce divergence
     if x >= width or y >= height:
         return
-
-    # Skip pixels that have already converged
+    
+    # Early exit for converged pixels - reduces thread divergence
     if d_mask[x, y] == 1:
-        count = d_sample_count[x, y]
-        if count > 0:
-            avg_r = d_accum_buffer[x, y, 0] / count
-            avg_g = d_accum_buffer[x, y, 1] / count
-            avg_b = d_accum_buffer[x, y, 2] / count
-            d_frame_output[x, y, 0] = avg_r
-            d_frame_output[x, y, 1] = avg_g
-            d_frame_output[x, y, 2] = avg_b
-        else:
-            d_frame_output[x, y, 0] = 0.0
-            d_frame_output[x, y, 1] = 0.0
-            d_frame_output[x, y, 2] = 0.0
         return
-
-    # Initialize local accumulators
+    
+    # Compute the 1D thread index for the RNG
+    pixel_idx = y * width + x
+    
+    # Precompute constants to reduce register usage
+    u_base = float32(x) / float32(width)
+    v_base = 1.0 - float32(y) / float32(height)
+    
+    # Preallocate arrays to reduce register pressure
+    ray_origin = cuda.local.array(3, dtype=float32)
+    ray_dir = cuda.local.array(3, dtype=float32)
+    sample_col = cuda.local.array(3, dtype=float32)
+    sample_depth = cuda.local.array(1, dtype=float32)
     local_color = cuda.local.array(3, dtype=float32)
     local_depth = cuda.local.array(1, dtype=float32)
+    
+    # Initialize arrays only once to reduce operations within loop
     for i in range(3):
+        ray_origin[i] = camera_origin[i]
         local_color[i] = 0.0
-    local_depth[0] = 1e20  # Initialize to far distance
-
-    pixel_idx = x + y * width
-
-    # Generate N samples for this pixel with stratified sampling
+    
+    local_depth[0] = 1e20
+    
+    # Process all samples for this pixel
     for s in range(N):
-        seq_idx = frame_number * N + s
-
-        # Use the precomputed Halton values for stratified sampling
-        jitter_x = halton_cached(pixel_idx * 4096 + seq_idx, 2, 
-                                d_halton_table_base2, d_halton_table_base3, d_halton_table_base5) / width
-        jitter_y = halton_cached(pixel_idx * 4096 + seq_idx, 3, 
-                                d_halton_table_base2, d_halton_table_base3, d_halton_table_base5) / height
-
-        # Compute normalized device coordinates
-        u = (float32(x) + jitter_x) / float32(width - 1)
-        v = 1.0 - ((float32(y) + jitter_y) / float32(height - 1))
-
-        # Generate ray
-        ray_origin = cuda.local.array(3, dtype=float32)
-        ray_dir = cuda.local.array(3, dtype=float32)
-        for i in range(3):
-            ray_origin[i] = camera_origin[i]
-            ray_dir[i] = (camera_lower_left[i] +
-                          u * camera_horizontal[i] +
-                          v * camera_vertical[i] -
-                          camera_origin[i])
-
-        # Normalize ray direction
-        normalize_inplace(ray_dir)
-
-        # Local arrays for sample color and depth
-        sample_col = cuda.local.array(3, dtype=float32)
-        sample_depth = cuda.local.array(1, dtype=float32)
+        # Reset sample color
         for i in range(3):
             sample_col[i] = 0.0
         sample_depth[0] = 1e20
-
+        
+        # Using stratified sampling with Halton sequence
+        # This provides better distribution of samples compared to uniform random
+        u_offset = halton_cached(d_halton_table_base2, (frame_number * N + s) % MAX_HALTON_SAMPLES) - 0.5
+        v_offset = halton_cached(d_halton_table_base3, (frame_number * N + s) % MAX_HALTON_SAMPLES) - 0.5
+        
+        # Scale offsets for stratification (smaller values for higher sample counts)
+        u_offset *= 0.95 / float32(math.sqrt(float32(N)))
+        v_offset *= 0.95 / float32(math.sqrt(float32(N)))
+        
+        # Calculate pixel coordinates with stratified sampling
+        u = u_base + u_offset / float32(width)
+        v = v_base + v_offset / float32(height)
+        
+        # Compute ray direction
+        for i in range(3):
+            ray_dir[i] = camera_lower_left[i] + u * camera_horizontal[i] + v * camera_vertical[i] - camera_origin[i]
+        
+        # Normalize ray direction
+        normalize_inplace(ray_dir)
+        
         # Trace ray with improved function
         trace_ray(ray_origin, ray_dir, MAX_BOUNCES,
             sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
@@ -138,45 +107,46 @@ def adaptive_render_kernel(width, height,
             d_env_map, d_env_cdf, env_total, env_width, env_height,
             bbox_min, bbox_max, left_indices, right_indices, 
             is_leaf, object_indices, num_nodes)
-
+        
         # Accumulate color and keep track of minimum depth
         for i in range(3):
             local_color[i] += sample_col[i]
         
         if sample_depth[0] < local_depth[0]:
             local_depth[0] = sample_depth[0]
-
-    # Average the samples for this frame
+    
+    # Average the samples for this frame - precompute inverse for faster division
     invN = 1.0 / float32(N)
     for i in range(3):
         local_color[i] *= invN
-
+    
     # Atomic additions to the accumulation buffers
     cuda.atomic.add(d_accum_buffer, (x, y, 0), local_color[0])
     cuda.atomic.add(d_accum_buffer, (x, y, 1), local_color[1])
     cuda.atomic.add(d_accum_buffer, (x, y, 2), local_color[2])
-    cuda.atomic.add(d_accum_buffer_sq, (x, y, 0), local_color[0] * local_color[0])
-    cuda.atomic.add(d_accum_buffer_sq, (x, y, 1), local_color[1] * local_color[1])
-    cuda.atomic.add(d_accum_buffer_sq, (x, y, 2), local_color[2] * local_color[2])
+    
+    # Compute squared values once to avoid repeated multiplication
+    local_color_sq = cuda.local.array(3, dtype=float32)
+    local_color_sq[0] = local_color[0] * local_color[0]
+    local_color_sq[1] = local_color[1] * local_color[1]
+    local_color_sq[2] = local_color[2] * local_color[2]
+    
+    cuda.atomic.add(d_accum_buffer_sq, (x, y, 0), local_color_sq[0])
+    cuda.atomic.add(d_accum_buffer_sq, (x, y, 1), local_color_sq[1])
+    cuda.atomic.add(d_accum_buffer_sq, (x, y, 2), local_color_sq[2])
+    
     cuda.atomic.add(d_sample_count, (x, y), N)
-
+    
     # Store depth for temporal reprojection
     if local_depth[0] < 1e20:
         d_depth_buffer[x, y] = local_depth[0]
-
-    # Compute current average for display
-    count_after = d_sample_count[x, y]
-    if count_after > 0:
-        avg_r = d_accum_buffer[x, y, 0] / float32(count_after)
-        avg_g = d_accum_buffer[x, y, 1] / float32(count_after)
-        avg_b = d_accum_buffer[x, y, 2] / float32(count_after)
-        d_frame_output[x, y, 0] = avg_r
-        d_frame_output[x, y, 1] = avg_g
-        d_frame_output[x, y, 2] = avg_b
-    else:
-        d_frame_output[x, y, 0] = 0.0
-        d_frame_output[x, y, 1] = 0.0
-        d_frame_output[x, y, 2] = 0.0
+    
+    # Store the output color
+    current_samples = d_sample_count[x, y]
+    if current_samples > 0:
+        inv_samples = 1.0 / float32(current_samples)
+        for i in range(3):
+            d_frame_output[x, y, i] = d_accum_buffer[x, y, i] * inv_samples
 
 @cuda.jit
 def render_kernel(width, height,
@@ -444,7 +414,27 @@ def trace_ray(origin, direction, max_bounces,
                                             float32(1e-4), closest_t, uv_temp)
                 if tval > 0.0:
                     closest_t = tval
-                    hit_idx = t_i
+                    hit_idx = t_i + s_count
+                    hit_sphere = False
+                    uv_coords[0] = uv_temp[0]
+                    uv_coords[1] = uv_temp[1]
+
+        # Always do a brute force check for triangles to ensure all are rendered
+        # This helps debug issues with the BVH traversal
+        if num_nodes > 0:  # Only do this if we have a BVH (meaning we have objects)
+            s_count = sphere_centers.shape[0]
+            t_count = triangle_vertices.shape[0]
+            
+            # Check all triangles brute force
+            for t_i in range(t_count):
+                tval = ray_triangle_intersect(current_origin, current_dir,
+                                            triangle_vertices[t_i, 0:3],
+                                            triangle_vertices[t_i, 3:6],
+                                            triangle_vertices[t_i, 6:9],
+                                            float32(1e-4), closest_t, uv_temp)
+                if tval > 0.0:
+                    closest_t = tval
+                    hit_idx = t_i + s_count
                     hit_sphere = False
                     uv_coords[0] = uv_temp[0]
                     uv_coords[1] = uv_temp[1]
@@ -495,9 +485,13 @@ def trace_ray(origin, direction, max_bounces,
         else:
             # It's a triangle
             compute_triangle_normal(triangle_vertices[hit_idx], hit_normal)
+            
+            # Instead of flipping normals, modify the material handling for backfaces
             if dot(current_dir, hit_normal) > 0.0:
+                # For backfaces, simply flip the normal without changing material properties
                 for i in range(3):
                     hit_normal[i] = -hit_normal[i]
+                
             mat_type = triangle_material_types[hit_idx]
             base_idx = hit_idx * 3
             for i in range(3):

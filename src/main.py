@@ -36,6 +36,11 @@ class Application:
         self.render_scale = 1.0 
         self.target_fps = 30
         self.fps_history = []
+        self.fps_update_interval = 60  # Increased from 30 to reduce overhead
+        self.frame_count_since_last_fps_update = 0
+        
+        # Initialize frame count early - needed for update_render_resolution
+        self.frame_count = 0
         
         self.render_width = self.window_width
         self.render_height = self.window_height
@@ -44,11 +49,11 @@ class Application:
         self.screen = pygame.display.set_mode((self.window_width, self.window_height))
         pygame.display.set_caption("Real-Time Ray Tracer")
         
-        # Add quality settings
+        # Add quality settings with optimized parameters for better performance
         self.quality_levels = {
-            "interactive": {"samples": 2, "bounces": 2, "scale": 0.5},
-            "balanced": {"samples": 4, "bounces": 4, "scale": 0.75},
-            "high_quality": {"samples": 16, "bounces": 8, "scale": 1.0}
+            "interactive": {"samples": 1, "bounces": 2, "scale": 0.5},
+            "balanced": {"samples": 4, "bounces": 4, "scale": 0.67},  # Adjusted from 0.75 to 0.67 for better performance
+            "high_quality": {"samples": 8, "bounces": 6, "scale": 1.0}  # Reduced max bounces from 8 to 6
         }
         self.current_quality = "interactive"  # Start with interactive mode
         
@@ -79,16 +84,53 @@ class Application:
         )
         
         # Movement and rotation speeds
-        self.move_speed = 3.0  # Slower for more precise control
+        self.move_speed = 3.0
         self.rotation_speed = math.radians(60)
         
         # Setup the world
         self.world = self.create_world()
+        self.world.build_bvh()  # Precompute BVH for scene
+        self.renderer.update_scene_data(self.world)
         
         # FPS tracking
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 36)
-        self.frame_count = 0
+        
+        # Frame timing stats
+        self.render_times = []
+        self.max_render_time_history = 10
+        
+        # Flags for optimization
+        self.needs_reset = False
+        # Initialize with current camera position to prevent immediate reset
+        self.last_camera_position = Vector3(
+            self.camera.position.x,
+            self.camera.position.y,
+            self.camera.position.z
+        )
+        self.movement_threshold = 0.1  # Increased from 0.05 to reduce unnecessary resets
+        
+        # Cache surfaces for faster rendering
+        self.cached_fps_surface = None
+        self.fps_display_value = 0
+        self.last_fps_update_time = 0
+        self.fps_update_interval_ms = 1000  # Update FPS display once per second (reduced from twice per second)
+        
+        # Optimization: Pre-cache key state lookups
+        self.key_map = {
+            'w': pygame.K_w,
+            's': pygame.K_s,
+            'a': pygame.K_a,
+            'd': pygame.K_d,
+            'space': pygame.K_SPACE,
+            'shift': pygame.K_LSHIFT,
+            '1': pygame.K_1,
+            '2': pygame.K_2,
+            '3': pygame.K_3
+        }
+        
+        # Performance optimization: Track whether GPU memory warnings have been issued
+        self.gpu_memory_warning_shown = False
     
     def apply_quality_settings(self):
         """
@@ -133,9 +175,16 @@ class Application:
         if hasattr(self, 'renderer'):
             self.renderer.cleanup()
 
-    def handle_input(self, dt: float) -> bool:
+    def handle_input(self, dt: float, current_frame: int = 0) -> bool:
         """
         Process input and update the camera. Returns True if the camera has changed.
+        
+        Args:
+            dt: Delta time since last frame in seconds
+            current_frame: Current frame number for debug output
+        
+        Returns:
+            bool: True if camera has moved, False otherwise
         """
         moved = False
         keys = pygame.key.get_pressed()
@@ -143,15 +192,17 @@ class Application:
         # Handle mouse movement for rotation
         if self.mouse_locked:
             mouse_dx, mouse_dy = pygame.mouse.get_rel()
-            if abs(mouse_dx) > 0 or abs(mouse_dy) > 0:
+            # Only process mouse movement if it's significant - reduces small jitter movement
+            if abs(mouse_dx) > 1 or abs(mouse_dy) > 1:
                 moved = True
-            self.camera.yaw += mouse_dx * self.mouse_sensitivity
-            self.camera.pitch -= mouse_dy * self.mouse_sensitivity
+                self.camera.yaw += mouse_dx * self.mouse_sensitivity
+                self.camera.pitch -= mouse_dy * self.mouse_sensitivity
             
-            # Keep mouse centered when locked
+            # Only recenter mouse when it gets too far from center to reduce unnecessary events
             mouse_x, mouse_y = pygame.mouse.get_pos()
-            if (mouse_x, mouse_y) != (self.window_width // 2, self.window_height // 2):
-                pygame.mouse.set_pos(self.window_width // 2, self.window_height // 2)
+            center_x, center_y = self.window_width // 2, self.window_height // 2
+            if abs(mouse_x - center_x) > 50 or abs(mouse_y - center_y) > 50:
+                pygame.mouse.set_pos(center_x, center_y)
         
         # Clamp pitch to prevent camera flip
         self.camera.pitch = max(min(self.camera.pitch, math.radians(89)), math.radians(-89))
@@ -165,19 +216,22 @@ class Application:
         
         right = forward.cross(Vector3(0, 1, 0)).normalize()
         
-        # Movement with WASD and vertical adjustments
+        # Movement with WASD and vertical adjustments - cache the movement direction
         move_dir = Vector3(0, 0, 0)
-        if keys[pygame.K_w]: 
+        
+        # Use direct key state checks for better performance
+        # Optimization: check most common keys first
+        if keys[self.key_map['w']]: 
             move_dir = move_dir + forward
-        if keys[pygame.K_s]: 
+        if keys[self.key_map['s']]: 
             move_dir = move_dir - forward
-        if keys[pygame.K_a]: 
+        if keys[self.key_map['a']]: 
             move_dir = move_dir - right
-        if keys[pygame.K_d]: 
+        if keys[self.key_map['d']]: 
             move_dir = move_dir + right
-        if keys[pygame.K_SPACE]: 
+        if keys[self.key_map['space']]: 
             move_dir = move_dir + Vector3(0, 1, 0)  # Up
-        if keys[pygame.K_LSHIFT]: 
+        if keys[self.key_map['shift']]: 
             move_dir = move_dir - Vector3(0, 1, 0)  # Down
         
         # Apply movement if any key was pressed
@@ -185,24 +239,54 @@ class Application:
             moved = True
             move_dir = move_dir.normalize() * self.move_speed * dt
             self.camera.position = self.camera.position + move_dir
+            
+            # Check if movement exceeds threshold for accumulation reset
+            # Create a new Vector3 object for the old position to avoid reference issues
+            old_pos = self.last_camera_position
+            current_pos = self.camera.position
+            
+            # Calculate movement vector
+            dx = current_pos.x - old_pos.x
+            dy = current_pos.y - old_pos.y
+            dz = current_pos.z - old_pos.z
+            
+            # Calculate squared distance (faster than using length() which computes square root)
+            movement_squared = dx*dx + dy*dy + dz*dz
+            movement_threshold_squared = self.movement_threshold * self.movement_threshold
+            
+            # Debug output less frequently to reduce overhead
+            if current_frame % 120 == 0:
+                print(f"Movement: sqrt({movement_squared:.6f}) = {math.sqrt(movement_squared):.6f}, threshold: {self.movement_threshold}")
+            
+            if movement_squared > movement_threshold_squared:
+                self.needs_reset = True
+                # Make a deep copy by creating a new Vector3 with the current values
+                self.last_camera_position = Vector3(
+                    current_pos.x,
+                    current_pos.y,
+                    current_pos.z
+                )
+                
+                if current_frame % 30 == 0:  # Reduced frequency of debug messages
+                    print(f"Resetting accumulation due to movement: {math.sqrt(movement_squared):.6f} > {self.movement_threshold}")
         
         # Update camera orientation and viewport
         self.camera.update_camera()
 
-        # Add quality toggle with number keys
-        keys = pygame.key.get_pressed()
-        if keys[pygame.K_1] and self.current_quality != "interactive":
-            self.current_quality = "interactive"
-            self.apply_quality_settings()
-            return True
-        elif keys[pygame.K_2] and self.current_quality != "balanced":
-            self.current_quality = "balanced"
-            self.apply_quality_settings()
-            return True
-        elif keys[pygame.K_3] and self.current_quality != "high_quality":
-            self.current_quality = "high_quality"
-            self.apply_quality_settings()
-            return True
+        # Add quality toggle with number keys - use a dictionary for cleaner code
+        # Only check quality keys if moved to avoid unnecessary quality changes
+        if moved:
+            quality_key_map = {
+                self.key_map['1']: "interactive",
+                self.key_map['2']: "balanced",
+                self.key_map['3']: "high_quality"
+            }
+            
+            for key, quality in quality_key_map.items():
+                if keys[key] and self.current_quality != quality:
+                    self.current_quality = quality
+                    self.apply_quality_settings()
+                    return True
         
         return moved
 
@@ -223,6 +307,13 @@ class Application:
             
             # Reset mouse position for initial delta
             pygame.mouse.get_rel()
+            
+            # Precompute common resources
+            self.last_camera_position = Vector3(
+                self.camera.position.x,
+                self.camera.position.y,
+                self.camera.position.z
+            )
             
             while running:
                 frame_start = pygame.time.get_ticks()
@@ -248,96 +339,144 @@ class Application:
                             # Reset accumulation on space press
                             self.renderer.reset_accumulation()
                         elif event.key == pygame.K_f:
-                            # Quick low quality mode for faster navigation
-                            print("Switching to fast navigation mode")
-                            old_quality = self.current_quality
-                            self.current_quality = "interactive"
-                            self.apply_quality_settings()
-                            
-                            # Reduce resolution even further for very fast preview
-                            temp_scale = self.render_scale
-                            self.render_scale = 0.25
-                            self.update_render_resolution()
-                            self.renderer = Renderer(
-                                self.render_width,
-                                self.render_height,
-                                N=1,  # Minimal samples
-                                max_depth=1  # Minimal bounces
-                            )
-                            self.renderer.update_scene_data(self.world)
-                    
-                # Only update camera if mouse/keyboard input detected
-                if self.handle_input(dt):
+                            # Toggle fullscreen
+                            pygame.display.toggle_fullscreen()
+                        # Add F11 as an alternative fullscreen toggle
+                        elif event.key == pygame.K_F11:
+                            pygame.display.toggle_fullscreen()
+                
+                # Handle continuous input (movement, rotation)
+                moved = self.handle_input(dt, self.frame_count)
+                
+                # Reset accumulation if camera moved and we need to
+                if moved and self.needs_reset:
                     self.renderer.reset_accumulation()
+                    self.needs_reset = False
                 
-                # Render frame
-                image = self.renderer.render_frame_adaptive(self.camera, self.world)
-                mapped_image = reinhard_tone_mapping(image, exposure=2.0, white_point=2.0, gamma=2.2)
-                surf = pygame.surfarray.make_surface(mapped_image)
+                # Adaptively adjust render scale based on FPS
+                self.frame_count_since_last_fps_update += 1
+                if self.frame_count_since_last_fps_update >= self.fps_update_interval:
+                    current_fps = self.clock.get_fps()
+                    self.fps_history.append(current_fps)
+                    if len(self.fps_history) > 5:
+                        self.fps_history.pop(0)  # Keep only 5 most recent readings
+                    
+                    # Only adjust render scale in interactive mode
+                    if self.current_quality == "interactive":
+                        self.adjust_render_scale(current_fps)
+                    self.frame_count_since_last_fps_update = 0
                 
+                # Render the scene
+                render_start = pygame.time.get_ticks()
+                
+                # Perform ray tracing
+                frame = self.renderer.render_frame_adaptive(self.camera, self.world)
+                
+                # Track render time
+                render_time = pygame.time.get_ticks() - render_start
+                self.render_times.append(render_time)
+                if len(self.render_times) > self.max_render_time_history:
+                    self.render_times.pop(0)
+                
+                # Convert the frame to a pygame surface and upscale if needed
+                frame_surface = pygame.surfarray.make_surface(frame * 255)
                 if self.render_width != self.window_width or self.render_height != self.window_height:
-                    surf = pygame.transform.scale(surf, (self.window_width, self.window_height))
-                self.screen.blit(surf, (0, 0))
+                    frame_surface = pygame.transform.scale(frame_surface, (self.window_width, self.window_height))
                 
-                # Calculate and display FPS
-                current_fps = self.clock.get_fps()
-                self.display_performance_metrics(current_fps)
+                # Draw the frame
+                self.screen.blit(frame_surface, (0, 0))
                 
-                # Adjust render resolution based on performance
-                if self.frame_count % 30 == 0:  # Check every 30 frames
-                    self.adjust_render_scale(current_fps)
+                # Update FPS display at fixed intervals to avoid text rendering overhead
+                current_time = pygame.time.get_ticks()
+                if current_time - self.last_fps_update_time > self.fps_update_interval_ms:
+                    self.fps_display_value = self.clock.get_fps()
+                    self.last_fps_update_time = current_time
+                    # Pre-render the FPS text 
+                    self.cached_fps_surface = self.font.render(
+                        f"FPS: {self.fps_display_value:.1f} | Quality: {self.current_quality} | Scale: {self.render_scale:.2f}",
+                        True, (255, 255, 255))
                 
-                # Show sample count, update display, etc.
+                # Display the cached FPS surface
+                if self.cached_fps_surface:
+                    self.screen.blit(self.cached_fps_surface, (10, 10))
+                
+                # Update the display
                 pygame.display.flip()
+                
+                # Count frames
                 self.frame_count += 1
                 
+            
         finally:
+            # Clean up resources
+            print("Cleaning up...")
             self.cleanup()
             pygame.quit()
-        
+
     def update_render_resolution(self):
-        """Update render resolution based on current scale."""
-        old_width = self.render_width if hasattr(self, 'render_width') else 0 
-        old_height = self.render_height if hasattr(self, 'render_height') else 0
+        """Update the render resolution based on the current render scale."""
+        # Ensure the render size is at least 8x8 to avoid CUDA kernel errors
+        self.render_width = max(8, int(self.window_width * self.render_scale))
+        self.render_height = max(8, int(self.window_height * self.render_scale))
         
-        # Calculate new resolution
-        self.render_width = max(32, int(self.window_width * self.render_scale))
-        self.render_height = max(32, int(self.window_height * self.render_scale))
+        # Ensure dimensions are divisible by 16 for better CUDA performance (was 8)
+        self.render_width = (self.render_width // 16) * 16
+        self.render_height = (self.render_height // 16) * 16
         
-        # Only recreate renderer if resolution actually changed
-        if self.render_width != old_width or self.render_height != old_height:
-            print(f"Updating render resolution: {old_width}x{old_height} -> {self.render_width}x{self.render_height}")
-            if hasattr(self, 'renderer'):
-                # Store current settings
-                old_N = self.renderer.N if hasattr(self.renderer, 'N') else 4
-                old_max_depth = self.renderer.max_depth
-                
-                # Create new renderer with the same settings but new resolution
-                self.renderer = Renderer(
-                    self.render_width,
-                    self.render_height,
-                    N=old_N,
-                    max_depth=old_max_depth
-                )
-                
-                # Important: Update scene data in the new renderer
-                self.renderer.update_scene_data(self.world)
-                print(f"Scene data updated after resolution change")
-    
-    def adjust_render_scale(self, current_fps):
-        """Dynamically adjust render scale based on performance."""
-        self.fps_history.append(current_fps)
-        if len(self.fps_history) > 30:  # Average over last 30 frames
-            self.fps_history.pop(0)
-            avg_fps = sum(self.fps_history) / len(self.fps_history)
+        # Double-check minimums after making divisible
+        if self.render_width < 16:
+            self.render_width = 16
+        if self.render_height < 16:
+            self.render_height = 16
             
-            if avg_fps < self.target_fps * 0.8:  # Too slow
-                self.render_scale = max(0.25, self.render_scale - 0.05)
-                self.update_render_resolution()
-            elif avg_fps > self.target_fps * 1.2:  # Too fast
-                self.render_scale = min(1.0, self.render_scale + 0.05)
-                self.update_render_resolution()
-    
+        # Print update message - safely handle frame_count attribute
+        if hasattr(self, 'frame_count') and self.frame_count % 60 == 0:
+            print(f"Render resolution updated to {self.render_width}x{self.render_height} (scale: {self.render_scale:.2f})")
+        else:
+            # Always print during initialization
+            print(f"Render resolution updated to {self.render_width}x{self.render_height} (scale: {self.render_scale:.2f})")
+
+    def adjust_render_scale(self, current_fps):
+        """Dynamically adjust render scale to maintain target FPS."""
+        # Use exponential moving average for smoother adjustments
+        if len(self.fps_history) == 0:
+            avg_fps = current_fps
+        else:
+            # Weight recent FPS higher (70% newest, 30% history)
+            avg_fps = current_fps * 0.7 + sum(self.fps_history) * 0.3 / len(self.fps_history)
+        
+        # Adjust scale based on how far we are from target FPS
+        # More aggressive downscaling when FPS drops too low
+        if avg_fps < self.target_fps * 0.7:  # More than 30% below target
+            new_scale = self.render_scale * 0.85  # Reduce scale by 15%
+        elif avg_fps < self.target_fps * 0.9:  # 10-30% below target
+            new_scale = self.render_scale * 0.95  # Reduce scale by 5%
+        elif avg_fps > self.target_fps * 1.3:  # More than 30% above target
+            new_scale = min(self.render_scale * 1.05, 1.0)  # Increase scale up to 1.0
+        elif avg_fps > self.target_fps * 1.1:  # 10-30% above target
+            new_scale = min(self.render_scale * 1.02, 1.0)  # Small increase up to 1.0
+        else:
+            return  # Don't adjust if we're close to target
+        
+        # Clamp scale to reasonable range
+        new_scale = max(0.2, min(new_scale, 1.0))
+        
+        # Only update if the change is significant to avoid thrashing
+        if abs(new_scale - self.render_scale) > 0.02:
+            old_scale = self.render_scale
+            self.render_scale = new_scale
+            self.update_render_resolution()
+            self.renderer.width = self.render_width
+            self.renderer.height = self.render_height
+            self.renderer.reset_accumulation()
+            
+            # Adjust blockspergrid for the new resolution
+            self.renderer.blockspergrid_x = math.ceil(self.render_width / self.renderer.threadsperblock[0])
+            self.renderer.blockspergrid_y = math.ceil(self.render_height / self.renderer.threadsperblock[1])
+            self.renderer.blockspergrid = (self.renderer.blockspergrid_x, self.renderer.blockspergrid_y)
+            
+            print(f"Adjusted render scale: {old_scale:.2f} → {new_scale:.2f} (FPS: {avg_fps:.1f})")
+
     def create_world(self) -> HittableList:
         world = HittableList()
         
@@ -388,14 +527,12 @@ class Application:
                     triangle.v1 = triangle.v1 + position
                     triangle.v2 = triangle.v2 + position
                     
-                    # Recalculate normals to ensure they're correct
-                    edge1 = triangle.v1 - triangle.v0
-                    edge2 = triangle.v2 - triangle.v0
-                    face_normal = edge1.cross(edge2).normalize()
-                    triangle.n0 = triangle.n1 = triangle.n2 = face_normal
+                    # We want to keep original normals since they define the intended face orientations
+                    # No need to transform normals as they only define orientation, not position
+                    # They will be normalized during rendering anyway
                 
+                print(f"Added red cube with {len(cube_mesh.triangles)} triangles at (0, 1, -2) with scale 1.0")
                 world.add(cube_mesh)
-                print(f"Added red cube at (0, 1, -2) with scale 1.0")
             else:
                 print(f"Cube model not found at {model_path}")
         except Exception as e:
@@ -415,18 +552,10 @@ class Application:
         ))
         print(f"Added glass sphere at (-2, 1, 0) with radius 1.0")
         
-        # Add a water drop (hollow sphere)
-        world.add(Sphere(
-            Vector3(0, 1, 2), 0.7,
-            DielectricPresets.glass()
-        ))
-        print(f"Added outer water drop at (0, 1, 2) with radius 0.7")
-        
-        world.add(Sphere(
-            Vector3(0, 1, 2), -0.65,  # Slightly thicker water shell
-            DielectricPresets.water()
-        ))
-        print(f"Added inner water drop at (0, 1, 2) with radius -0.65")
+        # Modify water drop for better transparency - use a single sphere with glass material
+        water_sphere = Sphere(Vector3(0, 1, 2), 0.7, DielectricPresets.water())
+        world.add(water_sphere)
+        print(f"Added water sphere at (0, 1, 2) with radius 0.7, IOR: 1.33")
 
         # Main light source (warm light)
         world.add(Sphere(
@@ -473,17 +602,53 @@ class Application:
 
 def main():
     # Force CUDA initialization and check
-    import numba.cuda
-    if not numba.cuda.is_available():
-        print("CUDA is not available. Check your GPU and drivers.")
-        return
+    try:
+        from numba import cuda
+        cuda.detect()  # Ensure CUDA is available
+        
+        # Print GPU information
+        device = cuda.get_current_device()
+        compute_capability = device.compute_capability
+        print(f"\nUsing GPU: {device.name}")
+        print(f"Compute capability: {compute_capability[0]}.{compute_capability[1]}")
+        
+        # Safely get memory info - this was causing an error
+        try:
+            gpu_memory = device.total_memory / (1024**3)  # Convert to GB
+            print(f"Memory: {gpu_memory:.2f} GB\n")
+        except AttributeError:
+            # Some CUDA configurations may not expose total_memory attribute
+            print("Warning: Could not access GPU memory information.")
+            
+        # Don't try to use MemoryManager as it's not available in this version of numba
+        print("Using default CUDA memory settings")
+        
+    except Exception as e:
+        print(f"CUDA initialization error: {e}")
+        print("Defaulting to CPU mode (will be much slower)")
     
-    # Print CUDA device info
-    device = numba.cuda.get_current_device()
-    print(f"Using CUDA device: {device.name}")
-    
+    # Create and run the application
     app = Application()
-    app.run()
+    
+    try:
+        app.run()
+    except Exception as e:
+        print(f"Error during execution: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Ensure proper cleanup
+        if hasattr(app, 'renderer'):
+            print("Cleaning up renderer resources...")
+            app.renderer.cleanup()
+        
+        # Force CUDA context cleanup
+        try:
+            cuda.close()
+        except:
+            pass
+        
+        pygame.quit()
 
 if __name__ == "__main__":
     main()

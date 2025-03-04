@@ -18,26 +18,44 @@ def reflect(out, v, n):
 
 @cuda.jit(device=True)
 def refract(v, n, ni_over_nt, out_refracted):
-    cos_theta = min(-dot(v, n), 1.0)
-    sin_theta = math.sqrt(1.0 - cos_theta * cos_theta)
+    """
+    Compute the refracted ray direction using Snell's law.
+    
+    Parameters:
+    v: Normalized incident ray direction
+    n: Normalized surface normal
+    ni_over_nt: Ratio of refractive indices (n1/n2)
+    out_refracted: Output array for the refracted ray direction
+    
+    Returns:
+    True if refraction occurs, False if total internal reflection occurs
+    """
+    # Calculate cosine of incident angle
+    cos_theta_i = -dot(v, n)
+    
+    # Check if ray is entering or exiting
+    if cos_theta_i < 0:
+        # Ray is exiting, flip normal and adjust refraction ratio
+        cos_theta_i = -cos_theta_i
+        for i in range(3):
+            n[i] = -n[i]
+        ni_over_nt = 1.0 / ni_over_nt
+    
+    # Calculate sine squared of refracted angle using Snell's law
+    sin2_theta_t = ni_over_nt * ni_over_nt * (1.0 - cos_theta_i * cos_theta_i)
     
     # Check for total internal reflection
-    if ni_over_nt * sin_theta > 1.0:
+    if sin2_theta_t >= 1.0:
         return False
     
-    # Calculate refracted ray components
-    r_out_perp = cuda.local.array(3, float32)
-    r_out_parallel = cuda.local.array(3, float32)
+    # Calculate cosine of refracted angle
+    cos_theta_t = math.sqrt(1.0 - sin2_theta_t)
     
-    # Perpendicular component: ni_over_nt * (v + cos_theta * n)
+    # Calculate refracted ray direction: ni_over_nt * incident + (ni_over_nt * cos_theta_i - cos_theta_t) * normal
     for i in range(3):
-        r_out_perp[i] = ni_over_nt * v[i] + (ni_over_nt * cos_theta - math.sqrt(1.0 - ni_over_nt * ni_over_nt * sin_theta * sin_theta)) * n[i]
+        out_refracted[i] = ni_over_nt * v[i] + (ni_over_nt * cos_theta_i - cos_theta_t) * n[i]
     
-    # Copy result to output
-    for i in range(3):
-        out_refracted[i] = r_out_perp[i]
-    
-    # Ensure the refracted ray is normalized
+    # Normalize the refracted ray
     normalize_inplace(out_refracted)
     return True
 
@@ -82,51 +100,68 @@ def scatter_lambertian(normal, rng_states, thread_id, out_scattered):
 @cuda.jit(device=True)
 def scatter_dielectric(current_dir, normal, ior, rng_states, thread_id, out_scattered):
     """
-    Compute dielectric (glass) scattering.
+    Compute dielectric (glass) scattering with proper transparency handling.
+    
+    Parameters:
+    current_dir: Incident ray direction
+    normal: Surface normal at intersection point
+    ior: Index of refraction of the material
+    rng_states: Random number generator states
+    thread_id: Thread ID for random number generation
+    out_scattered: Output array for the scattered ray direction
+    
+    Returns:
+    True if scattering occurs, False otherwise
     """
-    # Normalize incoming ray direction
-    unit_direction = cuda.local.array(3, float32)
-    length = math.sqrt(dot(current_dir, current_dir))
+    # Create normalized direction and normal vectors
+    unit_dir = cuda.local.array(3, dtype=float32)
+    unit_normal = cuda.local.array(3, dtype=float32)
+    
+    # Normalize direction
+    dir_length = math.sqrt(dot(current_dir, current_dir))
     for i in range(3):
-        unit_direction[i] = current_dir[i] / length
+        unit_dir[i] = current_dir[i] / dir_length
     
-    # Determine if we're entering or exiting the material
-    front_face = dot(unit_direction, normal) < 0
-    etai_over_etat = 1.0 / ior if front_face else ior
+    # Copy and normalize normal
+    normal_length = math.sqrt(dot(normal, normal))
+    for i in range(3):
+        unit_normal[i] = normal[i] / normal_length
     
-    # Calculate cos_theta
-    cos_theta = min(-dot(unit_direction, normal), 1.0)
-    sin_theta = math.sqrt(1.0 - cos_theta * cos_theta)
+    # Determine if we're entering or exiting
+    entering = dot(unit_dir, unit_normal) < 0.0
     
-    # Check for total internal reflection
-    if etai_over_etat * sin_theta > 1.0:
-        # Must reflect
-        reflected = cuda.local.array(3, float32)
-        reflect(unit_direction, normal, reflected)
+    # Set up the correct normal and refractive index ratio
+    working_normal = cuda.local.array(3, dtype=float32)
+    if entering:
         for i in range(3):
-            out_scattered[i] = reflected[i]
-        return True
+            working_normal[i] = unit_normal[i]
+        eta_ratio = 1.0 / ior
+    else:
+        for i in range(3):
+            working_normal[i] = -unit_normal[i]
+        eta_ratio = ior
     
-    # Calculate reflection probability using Schlick's approximation
-    reflect_prob = schlick(cos_theta, etai_over_etat)
+    # Calculate cosine of incident angle
+    cos_theta = min(abs(dot(unit_dir, working_normal)), 1.0)
     
-    # Probabilistically choose reflection or refraction
-    if xoroshiro128p_uniform_float32(rng_states, thread_id) < reflect_prob:
-        reflected = cuda.local.array(3, float32)
-        reflect(unit_direction, normal, reflected)
+    # Try to refract first
+    refracted = cuda.local.array(3, dtype=float32)
+    can_refract = refract(unit_dir, working_normal, eta_ratio, refracted)
+    
+    # Calculate Schlick's approximation for reflection probability
+    r0 = (1.0 - eta_ratio) / (1.0 + eta_ratio)
+    r0 = r0 * r0
+    reflect_prob = r0 + (1.0 - r0) * math.pow((1.0 - cos_theta), 5)
+    
+    # Either reflect (if can't refract or randomly based on reflection probability)
+    if not can_refract or xoroshiro128p_uniform_float32(rng_states, thread_id) < reflect_prob:
+        reflected = cuda.local.array(3, dtype=float32)
+        reflect(unit_dir, working_normal, reflected)
         for i in range(3):
             out_scattered[i] = reflected[i]
     else:
-        refracted = cuda.local.array(3, float32)
-        if refract(unit_direction, normal, etai_over_etat, refracted):
-            for i in range(3):
-                out_scattered[i] = refracted[i]
-        else:
-            # Fallback to reflection if refraction fails
-            reflected = cuda.local.array(3, float32)
-            reflect(unit_direction, normal, reflected)
-            for i in range(3):
-                out_scattered[i] = reflected[i]
+        for i in range(3):
+            out_scattered[i] = refracted[i]
     
     return True
 
