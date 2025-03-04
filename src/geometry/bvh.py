@@ -82,6 +82,11 @@ def flatten_bvh(bvh_root):
         index = len(nodes)
         nodes.append(None)  # placeholder
         if node.is_leaf:
+            # Ensure the object has a gpu_index attribute
+            if not hasattr(node.object, "gpu_index"):
+                print(f"WARNING: Object {node.object} has no gpu_index, assigning -1")
+                node.object.gpu_index = -1
+                
             flat_node = {
                 'bbox_min': [node.box.minimum.x, node.box.minimum.y, node.box.minimum.z],
                 'bbox_max': [node.box.maximum.x, node.box.maximum.y, node.box.maximum.z],

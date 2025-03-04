@@ -54,14 +54,17 @@ class Application:
         
         # Initialize camera with depth of field
         self.aspect_ratio = self.window_width / self.window_height
+        
+        # Adjust camera position to better view the scene
+        # Position the camera further back and higher to see more of the scene
         self.camera = Camera(
-            position=Vector3(0, 2, 6),
+            position=Vector3(0, 3, 10),  # Move back to z=10 and up to y=3
             yaw=0.0,
-            pitch=-0.0,
-            fov=math.radians(50),  # Slightly narrower FOV
+            pitch=-0.2,  # Look slightly downward
+            fov=math.radians(60),  # Wider FOV to see more
             aspect_ratio=self.aspect_ratio,
             aperture=0.01,  # Small aperture for subtle depth of field
-            focus_dist=8.0   # Focus on the scene center
+            focus_dist=10.0   # Focus on the scene center
         )
         
         # Initialize with quality settings
@@ -206,6 +209,13 @@ class Application:
     def run(self):
         try:
             # Update renderer's scene data before rendering.
+            print("\n=== Initializing Renderer ===")
+            print(f"Render resolution: {self.render_width}x{self.render_height}")
+            print(f"Quality settings: {self.current_quality}")
+            print(f"Samples per pixel: {self.quality_levels[self.current_quality]['samples']}")
+            print(f"Max bounces: {self.quality_levels[self.current_quality]['bounces']}")
+            print(f"Render scale: {self.render_scale}")
+            
             self.renderer.update_scene_data(self.world)
 
             running = True
@@ -334,6 +344,11 @@ class Application:
         # Import presets
         from materials.presets import MetalPresets, DielectricPresets, LightPresets, ColorPresets, TexturePresets
         
+        print("\n=== Creating World ===")
+        print(f"Camera position: {self.camera.position}")
+        print(f"Camera forward: {self.camera.forward}")
+        print(f"Camera focus distance: {self.camera.focus_dist}")
+        
         # Ground plane with checkerboard pattern
         ground_texture = TexturePresets.checkerboard(
             ColorPresets.WHITE * 0.8,  # Slightly dimmer white
@@ -343,12 +358,14 @@ class Application:
             Vector3(0, -1000, 0), 1000,
             Lambertian(ground_texture)
         ))
+        print(f"Added ground plane at y=-1000 with radius 1000")
         
         # Marble sphere
         world.add(Sphere(
             Vector3(-3, 1, 2), 1.0,
             Lambertian(TexturePresets.marble(scale=3.0, turbulence=6.0))
         ))
+        print(f"Added marble sphere at (-3, 1, 2) with radius 1.0")
         
         # Central red cube
         cube_material = ColorPresets.matte(ColorPresets.RED)
@@ -359,15 +376,28 @@ class Application:
                 cube_mesh = load_obj(model_path, cube_material)
                 # Scale and position the cube
                 for triangle in cube_mesh.triangles:
-                    scale = 2.0
+                    # Apply scale first
+                    scale = 1.0  # Reduced scale to make the cube more proportional
                     triangle.v0 = triangle.v0 * scale
                     triangle.v1 = triangle.v1 * scale
                     triangle.v2 = triangle.v2 * scale
-                    position = Vector3(0, 1, -3)
+                    
+                    # Then apply position
+                    position = Vector3(0, 1, -2)  # Moved closer to camera
                     triangle.v0 = triangle.v0 + position
                     triangle.v1 = triangle.v1 + position
                     triangle.v2 = triangle.v2 + position
+                    
+                    # Recalculate normals to ensure they're correct
+                    edge1 = triangle.v1 - triangle.v0
+                    edge2 = triangle.v2 - triangle.v0
+                    face_normal = edge1.cross(edge2).normalize()
+                    triangle.n0 = triangle.n1 = triangle.n2 = face_normal
+                
                 world.add(cube_mesh)
+                print(f"Added red cube at (0, 1, -2) with scale 1.0")
+            else:
+                print(f"Cube model not found at {model_path}")
         except Exception as e:
             print(f"Error loading model: {str(e)}")
         
@@ -376,31 +406,42 @@ class Application:
             Vector3(2, 1, 0), 1.0,
             MetalPresets.microfacet_gold()  # Use microfacet gold instead
         ))
+        print(f"Added gold sphere at (2, 1, 0) with radius 1.0")
         
         # Glass sphere
         world.add(Sphere(
             Vector3(-2, 1, 0), 1.0,
             DielectricPresets.glass()
         ))
+        print(f"Added glass sphere at (-2, 1, 0) with radius 1.0")
         
         # Add a water drop (hollow sphere)
         world.add(Sphere(
             Vector3(0, 1, 2), 0.7,
             DielectricPresets.glass()
         ))
+        print(f"Added outer water drop at (0, 1, 2) with radius 0.7")
+        
         world.add(Sphere(
             Vector3(0, 1, 2), -0.65,  # Slightly thicker water shell
             DielectricPresets.water()
         ))
+        print(f"Added inner water drop at (0, 1, 2) with radius -0.65")
 
         # Main light source (warm light)
         world.add(Sphere(
             Vector3(0, 6, 2), 0.5,
             LightPresets.warm_light(5.0)  # Higher intensity
         ))
+        print(f"Added light source at (0, 6, 2) with radius 0.5")
 
         # Build the BVH over everything:
+        print(f"Building BVH for {len(world.objects)} objects...")
         world.build_bvh()
+        print(f"BVH built successfully: {world.bvh_root is not None}")
+        if world.bvh_flat is not None:
+            bbox_min, bbox_max, left_indices, right_indices, is_leaf, object_indices = world.bvh_flat
+            print(f"BVH nodes: {len(object_indices)}")
         
         return world
     

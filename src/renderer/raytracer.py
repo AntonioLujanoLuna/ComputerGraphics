@@ -107,7 +107,7 @@ class Renderer:
         self.d_bvh_bbox_min = None
         self.d_bvh_bbox_max = None
         self.d_bvh_left = None
-        self.d_bvh_right = None 
+        self.d_bvh_right = None
         self.d_bvh_is_leaf = None
         self.d_bvh_object_indices = None
 
@@ -169,119 +169,127 @@ class Renderer:
 
     def update_scene_data(self, world) -> None:
         """
-        Update GPU buffers with scene data from the world objects.
-        Added detailed diagnostics and checks for debugging scene issues.
+        Update the scene data on the GPU.
+        
+        This method:
+        1. Extracts all spheres and triangles from the world
+        2. Prepares arrays for their properties (positions, materials, etc.)
+        3. Uploads these arrays to the GPU
+        4. Builds and uploads the BVH acceleration structure
+        
+        Parameters:
+            world: The scene containing objects to render
         """
-        # Count spheres and triangles
-        sphere_count = sum(1 for obj in world.objects if hasattr(obj, 'radius'))
-        mesh_objects = [obj for obj in world.objects if hasattr(obj, 'triangles')]
-        triangle_count = sum(len(mesh.triangles) for mesh in mesh_objects)
+        print("\n=== Updating Scene Data ===")
+        print(f"World contains {len(world.objects)} objects")
         
-        print(f"Updating scene data: {len(world.objects)} total objects")
-        print(f"  - {sphere_count} spheres")
-        print(f"  - {len(mesh_objects)} meshes with {triangle_count} triangles")
+        # Extract all spheres and triangles from the world
+        sphere_objects = []
+        mesh_objects = []
         
-        # Safety check: always update with at least 1 sphere to avoid empty buffers
-        if sphere_count == 0:
-            print("WARNING: No spheres in scene, adding dummy invisible sphere")
-            sphere_count = 1  # This ensures we'll still allocate buffers correctly
-        
-        # Clean up any existing GPU buffers
-        self.cleanup()
-
-        # Initialize arrays for scene data
-        centers = np.zeros((max(1, sphere_count), 3), dtype=np.float32)
-        radii = np.zeros(max(1, sphere_count), dtype=np.float32)
-        sphere_materials = np.zeros(max(1, sphere_count) * 3, dtype=np.float32)
-        sphere_material_types = np.zeros(max(1, sphere_count), dtype=np.int32)
-        sphere_roughness = np.zeros(max(1, sphere_count), dtype=np.float32)
-
-        # Initialize texture arrays with default values even if no textures exist
-        texture_data = np.zeros(3, dtype=np.float32)  # Minimal default texture (RGB)
-        texture_dimensions = np.array([[1, 1]], dtype=np.int32)  # Default dimensions
-        
-        self.d_texture_data = cuda.to_device(texture_data)
-        self.texture_dimensions = cuda.to_device(texture_dimensions)
-        
-        # Initialize texture indices with -1 (no texture)
-        num_texture_entries = max(1, sphere_count + triangle_count)
-        default_texture_indices = -np.ones((num_texture_entries,), dtype=np.int32)
-        self.d_texture_indices = cuda.to_device(default_texture_indices)
-
-        # Initialize triangle arrays with at least one entry
-        triangle_vertices = np.zeros((max(1, triangle_count), 9), dtype=np.float32)
-        triangle_uvs = np.zeros((max(1, triangle_count), 6), dtype=np.float32)
-        triangle_materials = np.zeros((max(1, triangle_count) * 3), dtype=np.float32)
-        triangle_material_types = np.zeros((max(1, triangle_count)), dtype=np.int32)
-        triangle_roughness = np.zeros(max(1, triangle_count), dtype=np.float32)
-
-        # Fill arrays with actual scene data
-        sphere_idx = 0
         for obj in world.objects:
             if hasattr(obj, 'radius'):
-                # Extract sphere data
-                print(f"  Adding sphere at ({obj.center.x}, {obj.center.y}, {obj.center.z}) with radius {obj.radius}")
-                centers[sphere_idx] = [obj.center.x, obj.center.y, obj.center.z]
-                radii[sphere_idx] = obj.radius
-                mat_idx = sphere_idx * 3
-                mat = obj.material
-                
-                # Determine material type and properties
-                if hasattr(mat, 'emitted') and callable(mat.emitted):
-                    emission = mat.emitted(0, 0, obj.center)
-                    sphere_materials[mat_idx:mat_idx+3] = [emission.x, emission.y, emission.z]
-                    sphere_material_types[sphere_idx] = 2  # Emissive
-                    sphere_roughness[sphere_idx] = 0.0
-                    print(f"    Emissive material: ({emission.x}, {emission.y}, {emission.z})")
-                elif isinstance(mat, Metal):
-                    if hasattr(mat, 'texture') and mat.texture is not None:
-                        if hasattr(mat.texture, 'color'):
-                            sphere_materials[mat_idx:mat_idx+3] = [mat.texture.color.x, mat.texture.color.y, mat.texture.color.z]
-                            print(f"    Metal material: ({mat.texture.color.x}, {mat.texture.color.y}, {mat.texture.color.z})")
-                        else:
-                            color = mat.texture.sample(UV(0.5, 0.5))
-                            sphere_materials[mat_idx:mat_idx+3] = [color.x, color.y, color.z]
-                            print(f"    Metal material with texture: ({color.x}, {color.y}, {color.z})")
+                sphere_objects.append(obj)
+            elif hasattr(obj, 'triangles'):
+                mesh_objects.append(obj)
+        
+        print(f"Found {len(sphere_objects)} spheres and {len(mesh_objects)} meshes")
+        
+        # Count total triangles
+        triangle_count = sum(len(mesh.triangles) for mesh in mesh_objects)
+        print(f"Total triangles: {triangle_count}")
+        
+        # Prepare arrays for sphere data
+        centers = np.zeros((len(sphere_objects), 3), dtype=np.float32)
+        radii = np.zeros(len(sphere_objects), dtype=np.float32)
+        sphere_materials = np.zeros(len(sphere_objects) * 3, dtype=np.float32)
+        sphere_material_types = np.zeros(len(sphere_objects), dtype=np.int32)
+        sphere_roughness = np.zeros(len(sphere_objects), dtype=np.float32)
+        
+        # Prepare arrays for triangle data
+        triangle_vertices = np.zeros((triangle_count, 9), dtype=np.float32)  # 3 vertices * 3 coordinates
+        triangle_uvs = np.zeros((triangle_count, 6), dtype=np.float32)  # 3 vertices * 2 UV coordinates
+        triangle_materials = np.zeros(triangle_count * 3, dtype=np.float32)
+        triangle_material_types = np.zeros(triangle_count, dtype=np.int32)
+        triangle_roughness = np.zeros(triangle_count, dtype=np.float32)
+        
+        # Fill sphere data
+        sphere_idx = 0
+        for obj in sphere_objects:
+            # Assign a GPU index for BVH
+            obj.gpu_index = sphere_idx
+            
+            # Fill position and radius
+            centers[sphere_idx] = [obj.center.x, obj.center.y, obj.center.z]
+            radii[sphere_idx] = obj.radius
+            
+            # Fill material data
+            mat_idx = sphere_idx * 3
+            mat = obj.material
+            
+            # Determine material type and properties
+            if hasattr(mat, 'emitted') and callable(mat.emitted):
+                emission = mat.emitted(0, 0, obj.center)
+                sphere_materials[mat_idx:mat_idx+3] = [emission.x, emission.y, emission.z]
+                sphere_material_types[sphere_idx] = 2  # Emissive
+                sphere_roughness[sphere_idx] = 0.0
+                print(f"    Sphere {sphere_idx}: Emissive material: ({emission.x}, {emission.y}, {emission.z})")
+            elif isinstance(mat, Metal):
+                if hasattr(mat, 'texture') and mat.texture is not None:
+                    if hasattr(mat.texture, 'color'):
+                        sphere_materials[mat_idx:mat_idx+3] = [mat.texture.color.x, mat.texture.color.y, mat.texture.color.z]
+                        print(f"    Sphere {sphere_idx}: Metal material: ({mat.texture.color.x}, {mat.texture.color.y}, {mat.texture.color.z})")
                     else:
-                        # Default metal color if no texture
-                        sphere_materials[mat_idx:mat_idx+3] = [0.8, 0.8, 0.8]  # Default to silver
-                        print(f"    Metal material with default color (0.8, 0.8, 0.8)")
-                    sphere_material_types[sphere_idx] = 1  # Metal
-                    sphere_roughness[sphere_idx] = mat.fuzz if hasattr(mat, 'fuzz') else 0.1
-                elif isinstance(mat, Dielectric):
-                    sphere_materials[mat_idx:mat_idx+3] = [mat.ref_idx, 0.0, 0.0]
-                    sphere_material_types[sphere_idx] = 3  # Dielectric
-                    sphere_roughness[sphere_idx] = 0.0
-                    print(f"    Dielectric material: ref_idx = {mat.ref_idx}")
-                elif isinstance(mat, MicrofacetMetal):
-                    sphere_materials[mat_idx:mat_idx+3] = [mat.albedo.x, mat.albedo.y, mat.albedo.z]
-                    sphere_material_types[sphere_idx] = 4  # MicrofacetMetal
-                    sphere_roughness[sphere_idx] = mat.roughness
-                    print(f"    Microfacet material: ({mat.albedo.x}, {mat.albedo.y}, {mat.albedo.z}) roughness={mat.roughness}")
+                        color = mat.texture.sample(UV(0.5, 0.5))
+                        sphere_materials[mat_idx:mat_idx+3] = [color.x, color.y, color.z]
+                        print(f"    Sphere {sphere_idx}: Metal material with texture: ({color.x}, {color.y}, {color.z})")
                 else:
-                    # Default to Lambertian
-                    if hasattr(mat, 'texture') and mat.texture is not None:
-                        if hasattr(mat.texture, 'color'):
-                            sphere_materials[mat_idx:mat_idx+3] = [mat.texture.color.x, mat.texture.color.y, mat.texture.color.z]
-                            print(f"    Lambertian material: ({mat.texture.color.x}, {mat.texture.color.y}, {mat.texture.color.z})")
-                        else:
-                            color = mat.texture.sample(UV(0.5, 0.5))
-                            sphere_materials[mat_idx:mat_idx+3] = [color.x, color.y, color.z]
-                            print(f"    Lambertian material with texture: ({color.x}, {color.y}, {color.z})")
+                    # Default metal color if no texture
+                    sphere_materials[mat_idx:mat_idx+3] = [0.8, 0.8, 0.8]  # Default to silver
+                    print(f"    Sphere {sphere_idx}: Metal material with default color (0.8, 0.8, 0.8)")
+                sphere_material_types[sphere_idx] = 1  # Metal
+                sphere_roughness[sphere_idx] = mat.fuzz if hasattr(mat, 'fuzz') else 0.1
+            elif isinstance(mat, Dielectric):
+                sphere_materials[mat_idx:mat_idx+3] = [mat.ref_idx, 0.0, 0.0]
+                sphere_material_types[sphere_idx] = 3  # Dielectric
+                sphere_roughness[sphere_idx] = 0.0
+                print(f"    Sphere {sphere_idx}: Dielectric material: ref_idx = {mat.ref_idx}")
+            elif isinstance(mat, MicrofacetMetal):
+                sphere_materials[mat_idx:mat_idx+3] = [mat.albedo.x, mat.albedo.y, mat.albedo.z]
+                sphere_material_types[sphere_idx] = 4  # MicrofacetMetal
+                sphere_roughness[sphere_idx] = mat.roughness
+                print(f"    Sphere {sphere_idx}: Microfacet material: ({mat.albedo.x}, {mat.albedo.y}, {mat.albedo.z}) roughness={mat.roughness}")
+            else:
+                # Default to Lambertian
+                if hasattr(mat, 'texture') and mat.texture is not None:
+                    if hasattr(mat.texture, 'color'):
+                        sphere_materials[mat_idx:mat_idx+3] = [mat.texture.color.x, mat.texture.color.y, mat.texture.color.z]
+                        print(f"    Sphere {sphere_idx}: Lambertian material: ({mat.texture.color.x}, {mat.texture.color.y}, {mat.texture.color.z})")
                     else:
-                        # Default lambertian color if no texture
-                        sphere_materials[mat_idx:mat_idx+3] = [0.5, 0.5, 0.5]  # Default to gray
-                        print(f"    Lambertian material with default color (0.5, 0.5, 0.5)")
-                    sphere_material_types[sphere_idx] = 0  # Lambertian or other
-                    sphere_roughness[sphere_idx] = 0.0
-                
-                sphere_idx += 1
-
+                        color = mat.texture.sample(UV(0.5, 0.5))
+                        sphere_materials[mat_idx:mat_idx+3] = [color.x, color.y, color.z]
+                        print(f"    Sphere {sphere_idx}: Lambertian material with texture: ({color.x}, {color.y}, {color.z})")
+                else:
+                    # Default lambertian color if no texture
+                    sphere_materials[mat_idx:mat_idx+3] = [0.5, 0.5, 0.5]  # Default to gray
+                    print(f"    Sphere {sphere_idx}: Lambertian material with default color (0.5, 0.5, 0.5)")
+                sphere_material_types[sphere_idx] = 0  # Lambertian or other
+                sphere_roughness[sphere_idx] = 0.0
+            
+            sphere_idx += 1
+        
         # Fill triangle data
         triangle_idx = 0
-        for mesh in mesh_objects:
-            print(f"  Adding mesh with {len(mesh.triangles)} triangles")
-            for triangle in mesh.triangles:
+        for mesh_idx, mesh in enumerate(mesh_objects):
+            print(f"  Adding mesh {mesh_idx} with {len(mesh.triangles)} triangles")
+            
+            # Assign GPU indices to the mesh itself
+            mesh.gpu_index = len(sphere_objects) + triangle_idx
+            
+            for tri_idx, triangle in enumerate(mesh.triangles):
+                # Assign GPU indices to each triangle
+                triangle.gpu_index = len(sphere_objects) + triangle_idx
+                
                 # Fill triangle vertex data
                 triangle_vertices[triangle_idx, 0:3] = [triangle.v0.x, triangle.v0.y, triangle.v0.z]
                 triangle_vertices[triangle_idx, 3:6] = [triangle.v1.x, triangle.v1.y, triangle.v1.z]
@@ -302,50 +310,46 @@ class Renderer:
                     triangle_materials[mat_idx:mat_idx+3] = [emission.x, emission.y, emission.z]
                     triangle_material_types[triangle_idx] = 2  # Emissive
                     triangle_roughness[triangle_idx] = 0.0
-                    print(f"    Triangle with emissive material: ({emission.x}, {emission.y}, {emission.z})")
+                    print(f"    Triangle {triangle_idx}: Emissive material: ({emission.x}, {emission.y}, {emission.z})")
                 elif isinstance(mat, Metal):
                     if hasattr(mat, 'texture') and mat.texture is not None:
                         if hasattr(mat.texture, 'color'):
                             triangle_materials[mat_idx:mat_idx+3] = [mat.texture.color.x, mat.texture.color.y, mat.texture.color.z]
-                            print(f"    Triangle with metal material: ({mat.texture.color.x}, {mat.texture.color.y}, {mat.texture.color.z})")
+                            print(f"    Triangle {triangle_idx}: Metal material: ({mat.texture.color.x}, {mat.texture.color.y}, {mat.texture.color.z})")
                         else:
                             color = mat.texture.sample(UV(0.5, 0.5))
                             triangle_materials[mat_idx:mat_idx+3] = [color.x, color.y, color.z]
-                            print(f"    Triangle with metal material and texture")
+                            print(f"    Triangle {triangle_idx}: Metal material with texture")
                     else:
                         # Default metal color if no texture
                         triangle_materials[mat_idx:mat_idx+3] = [0.8, 0.8, 0.8]  # Default to silver
-                        print(f"    Triangle with metal material and default color")
+                        print(f"    Triangle {triangle_idx}: Metal material with default color")
                     triangle_material_types[triangle_idx] = 1  # Metal
                     triangle_roughness[triangle_idx] = mat.fuzz if hasattr(mat, 'fuzz') else 0.1
                 elif isinstance(mat, Dielectric):
                     triangle_materials[mat_idx:mat_idx+3] = [mat.ref_idx, 0.0, 0.0]
                     triangle_material_types[triangle_idx] = 3  # Dielectric
                     triangle_roughness[triangle_idx] = 0.0
-                    print(f"    Triangle with dielectric material")
-                elif isinstance(mat, MicrofacetMetal):
-                    triangle_materials[mat_idx:mat_idx+3] = [mat.albedo.x, mat.albedo.y, mat.albedo.z]
-                    triangle_material_types[triangle_idx] = 4  # MicrofacetMetal
-                    triangle_roughness[triangle_idx] = mat.roughness
-                    print(f"    Triangle with microfacet material")
+                    print(f"    Triangle {triangle_idx}: Dielectric material: ref_idx = {mat.ref_idx}")
                 else:
                     # Default to Lambertian
                     if hasattr(mat, 'texture') and mat.texture is not None:
                         if hasattr(mat.texture, 'color'):
                             triangle_materials[mat_idx:mat_idx+3] = [mat.texture.color.x, mat.texture.color.y, mat.texture.color.z]
-                            print(f"    Triangle with lambertian material: ({mat.texture.color.x}, {mat.texture.color.y}, {mat.texture.color.z})")
+                            print(f"    Triangle {triangle_idx}: Lambertian material: ({mat.texture.color.x}, {mat.texture.color.y}, {mat.texture.color.z})")
                         else:
                             color = mat.texture.sample(UV(0.5, 0.5))
-                            triangle_materials[mat_idx:mat_idx+3] = [color.x, color.y, color.z] 
-                            print(f"    Triangle with lambertian material and texture")
+                            triangle_materials[mat_idx:mat_idx+3] = [color.x, color.y, color.z]
+                            print(f"    Triangle {triangle_idx}: Lambertian material with texture")
                     else:
                         # Default lambertian color if no texture
                         triangle_materials[mat_idx:mat_idx+3] = [0.5, 0.5, 0.5]  # Default to gray
-                        print(f"    Triangle with lambertian material and default color")
+                        print(f"    Triangle {triangle_idx}: Lambertian material with default color")
                     triangle_material_types[triangle_idx] = 0  # Lambertian or other
-                    
+                    triangle_roughness[triangle_idx] = 0.0
+                
                 triangle_idx += 1
-
+        
         # Upload data to GPU
         self.d_sphere_centers = cuda.to_device(np.ascontiguousarray(centers))
         self.d_sphere_radii = cuda.to_device(np.ascontiguousarray(radii))
@@ -363,7 +367,22 @@ class Renderer:
         for obj in world.objects:
             if hasattr(obj, 'material') and hasattr(obj.material, 'texture'):
                 textures.add(obj.material.texture)
-        self.load_textures(list(textures))
+        
+        # Ensure we have at least a default texture
+        if not textures:
+            print("No textures found, creating default texture")
+            default_texture_data = np.array([0.5, 0.5, 0.5], dtype=np.float32)  # Default gray
+            self.d_texture_data = cuda.to_device(default_texture_data)
+            self.texture_dimensions = cuda.to_device(np.array([[1, 1]], dtype=np.int32))
+            self.d_texture_indices = cuda.to_device(np.zeros(1, dtype=np.int32))
+        else:
+            self.load_textures(list(textures))
+            
+            # Ensure texture indices is initialized
+            if not hasattr(self, 'd_texture_indices') or self.d_texture_indices is None:
+                print("Initializing texture indices")
+                num_objects = len(sphere_objects) + triangle_count
+                self.d_texture_indices = cuda.to_device(np.zeros(num_objects, dtype=np.int32))
 
         # Allocate adaptive sampling buffers
         self.d_accum_buffer = cuda.to_device(np.zeros((self.width, self.height, 3), dtype=np.float32))
@@ -372,6 +391,78 @@ class Renderer:
         self.d_mask = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32))
 
         # Build the BVH over the world objects
+        print(f"Building BVH for {len(world.objects)} objects...")
+        
+        # Ensure all objects have a gpu_index attribute before building the BVH
+        for i, obj in enumerate(world.objects):
+            if not hasattr(obj, 'gpu_index'):
+                print(f"WARNING: Object {i} has no gpu_index, assigning one")
+                if hasattr(obj, 'radius'):
+                    # It's a sphere
+                    sphere_idx = next((j for j, s in enumerate(sphere_objects) if s is obj), -1)
+                    obj.gpu_index = sphere_idx
+                elif hasattr(obj, 'triangles'):
+                    # It's a mesh
+                    mesh_idx = next((j for j, m in enumerate(mesh_objects) if m is obj), -1)
+                    if mesh_idx >= 0:
+                        obj.gpu_index = len(sphere_objects) + sum(len(mesh_objects[k].triangles) for k in range(mesh_idx))
+                    else:
+                        obj.gpu_index = -1
+                else:
+                    obj.gpu_index = -1
+                    
+        world.build_bvh()
+        print(f"  BVH built successfully: {world.bvh_root is not None}")
+
+        # Process texture data
+        textures = set()
+        for obj in world.objects:
+            if hasattr(obj, 'material') and hasattr(obj.material, 'texture'):
+                textures.add(obj.material.texture)
+        
+        # Ensure we have at least a default texture
+        if not textures:
+            print("No textures found, creating default texture")
+            default_texture_data = np.array([0.5, 0.5, 0.5], dtype=np.float32)  # Default gray
+            self.d_texture_data = cuda.to_device(default_texture_data)
+            self.texture_dimensions = cuda.to_device(np.array([[1, 1]], dtype=np.int32))
+            self.d_texture_indices = cuda.to_device(np.zeros(1, dtype=np.int32))
+        else:
+            self.load_textures(list(textures))
+            
+            # Ensure texture indices is initialized
+            if not hasattr(self, 'd_texture_indices') or self.d_texture_indices is None:
+                print("Initializing texture indices")
+                num_objects = len(sphere_objects) + triangle_count
+                self.d_texture_indices = cuda.to_device(np.zeros(num_objects, dtype=np.int32))
+
+        # Allocate adaptive sampling buffers
+        self.d_accum_buffer = cuda.to_device(np.zeros((self.width, self.height, 3), dtype=np.float32))
+        self.d_accum_buffer_sq = cuda.to_device(np.zeros((self.width, self.height, 3), dtype=np.float32))
+        self.d_sample_count = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32))
+        self.d_mask = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32))
+
+        # Build the BVH over the world objects
+        print(f"Building BVH for {len(world.objects)} objects...")
+        
+        # Ensure all objects have a gpu_index attribute before building the BVH
+        for i, obj in enumerate(world.objects):
+            if not hasattr(obj, 'gpu_index'):
+                print(f"WARNING: Object {i} has no gpu_index, assigning one")
+                if hasattr(obj, 'radius'):
+                    # It's a sphere
+                    sphere_idx = next((j for j, s in enumerate(sphere_objects) if s is obj), -1)
+                    obj.gpu_index = sphere_idx
+                elif hasattr(obj, 'triangles'):
+                    # It's a mesh
+                    mesh_idx = next((j for j, m in enumerate(mesh_objects) if m is obj), -1)
+                    if mesh_idx >= 0:
+                        obj.gpu_index = len(sphere_objects) + sum(len(mesh_objects[k].triangles) for k in range(mesh_idx))
+                    else:
+                        obj.gpu_index = -1
+                else:
+                    obj.gpu_index = -1
+                    
         world.build_bvh()
         print(f"  BVH built successfully: {world.bvh_root is not None}")
 
@@ -385,6 +476,21 @@ class Renderer:
             self.d_bvh_is_leaf = cuda.to_device(is_leaf)
             self.d_bvh_object_indices = cuda.to_device(object_indices)
             print(f"  BVH data uploaded: {len(object_indices)} nodes")
+            
+            # Print some BVH node data for debugging
+            print(f"  BVH root bounding box: min=({bbox_min[0][0]}, {bbox_min[0][1]}, {bbox_min[0][2]}), max=({bbox_max[0][0]}, {bbox_max[0][1]}, {bbox_max[0][2]})")
+            
+            # Check if any objects are assigned to leaf nodes
+            leaf_count = sum(1 for i in range(len(is_leaf)) if is_leaf[i] == 1)
+            valid_objects = sum(1 for i in range(len(is_leaf)) if is_leaf[i] == 1 and object_indices[i] >= 0)
+            print(f"  BVH leaf nodes: {leaf_count}, with valid objects: {valid_objects}")
+            
+            # Check if object indices match the number of objects
+            if valid_objects != len(world.objects):
+                print(f"  WARNING: Mismatch between valid BVH object indices ({valid_objects}) and world objects ({len(world.objects)})")
+                
+                # Print the first few object indices for debugging
+                print(f"  First 10 object indices: {object_indices[:min(10, len(object_indices))]}")
         else:
             print("  WARNING: No BVH data available to upload")
             self.d_bvh_bbox_min = None
@@ -427,6 +533,11 @@ class Renderer:
         sphere_count = sum(1 for obj in world.objects if hasattr(obj, 'radius'))
         mesh_objects = [obj for obj in world.objects if hasattr(obj, 'triangles')]
         triangle_count = sum(len(mesh.triangles) for mesh in mesh_objects)
+        
+        print(f"\n=== Rendering Frame {self.frame_number} ===")
+        print(f"Scene contains {len(world.objects)} objects: {sphere_count} spheres, {len(mesh_objects)} meshes with {triangle_count} triangles")
+        print(f"Camera position: ({camera.position.x}, {camera.position.y}, {camera.position.z})")
+        print(f"Camera direction: ({camera.forward.x}, {camera.forward.y}, {camera.forward.z})")
         
         # More specific check for scene data initialization with better diagnostics
         scene_init_needed = False
@@ -553,34 +664,96 @@ class Renderer:
         # --- Determine BVH parameters ---
         # Get BVH node count if available
         num_nodes = 0
+        has_bvh = False
         if hasattr(self, 'd_bvh_bbox_min') and self.d_bvh_bbox_min is not None:
             num_nodes = self.d_bvh_bbox_min.shape[0]
+            has_bvh = True
+            print(f"Using BVH with {num_nodes} nodes for acceleration")
+        else:
+            print("WARNING: No BVH data available for acceleration")
 
+        # Check for any None values in the parameters
+        print("Checking for None values in parameters:")
+        if self.d_sphere_centers is None: print("d_sphere_centers is None")
+        if self.d_sphere_radii is None: print("d_sphere_radii is None")
+        if self.d_sphere_materials is None: print("d_sphere_materials is None")
+        if self.d_sphere_material_types is None: print("d_sphere_material_types is None")
+        if self.d_sphere_roughness is None: print("d_sphere_roughness is None")
+        if self.d_triangle_vertices is None: print("d_triangle_vertices is None")
+        if self.d_triangle_uvs is None: print("d_triangle_uvs is None")
+        if self.d_triangle_materials is None: print("d_triangle_materials is None")
+        if self.d_triangle_material_types is None: print("d_triangle_material_types is None")
+        if self.d_triangle_roughness is None: print("d_triangle_roughness is None")
+        if self.d_texture_data is None: print("d_texture_data is None")
+        if self.texture_dimensions is None: print("texture_dimensions is None")
+        if self.d_texture_indices is None: print("d_texture_indices is None")
+        if self.d_accum_buffer is None: print("d_accum_buffer is None")
+        if self.d_accum_buffer_sq is None: print("d_accum_buffer_sq is None")
+        if self.d_sample_count is None: print("d_sample_count is None")
+        if self.d_mask is None: print("d_mask is None")
+        if self.d_frame_output is None: print("d_frame_output is None")
+        if d_depth_buffer is None: print("d_depth_buffer is None")
+        if self.rng_states is None: print("rng_states is None")
+        if self.d_env_map is None: print("d_env_map is None")
+        if self.d_env_cdf is None: print("d_env_cdf is None")
+        if self.d_halton_table_base2 is None: print("d_halton_table_base2 is None")
+        if self.d_halton_table_base3 is None: print("d_halton_table_base3 is None")
+        if self.d_halton_table_base5 is None: print("d_halton_table_base5 is None")
+        
         # --- Launch Adaptive Render Kernel ---
-        adaptive_render_kernel[self.blockspergrid, self.threadsperblock, stream](
-            self.width, self.height,
-            self.d_camera_origin, self.d_camera_lower_left,
-            self.d_camera_horizontal, self.d_camera_vertical,
-            self.d_sphere_centers, self.d_sphere_radii, 
-            self.d_sphere_materials, self.d_sphere_material_types,
-            self.d_sphere_roughness,  
-            self.d_triangle_vertices, self.d_triangle_uvs, 
-            self.d_triangle_materials, self.d_triangle_material_types,
-            self.d_triangle_roughness, 
-            self.d_texture_data, self.texture_dimensions, self.d_texture_indices,
-            self.d_accum_buffer, self.d_accum_buffer_sq, 
-            self.d_sample_count, self.d_mask, self.d_frame_output, d_depth_buffer,
-            self.frame_number, self.rng_states, self.N,
-            self.d_env_map, self.d_env_cdf, self.env_total, self.env_width, self.env_height,
-            self.d_halton_table_base2, self.d_halton_table_base3, self.d_halton_table_base5,
-            self.d_bvh_bbox_min if num_nodes > 0 else None,
-            self.d_bvh_bbox_max if num_nodes > 0 else None,
-            self.d_bvh_left if num_nodes > 0 else None,
-            self.d_bvh_right if num_nodes > 0 else None,
-            self.d_bvh_is_leaf if num_nodes > 0 else None,
-            self.d_bvh_object_indices if num_nodes > 0 else None,
-            num_nodes
-        )
+        # Create empty arrays if BVH is not available to avoid passing None to CUDA
+        if not has_bvh:
+            empty_array_3d = cuda.to_device(np.zeros((1, 3), dtype=np.float32))
+            empty_array_1d = cuda.to_device(np.zeros(1, dtype=np.int32))
+            
+            # Initialize texture indices if it's None
+            if not hasattr(self, 'd_texture_indices') or self.d_texture_indices is None:
+                print("Creating empty texture indices array")
+                self.d_texture_indices = cuda.to_device(np.zeros(1, dtype=np.int32))
+            
+            adaptive_render_kernel[self.blockspergrid, self.threadsperblock, stream](
+                self.width, self.height,
+                self.d_camera_origin, self.d_camera_lower_left,
+                self.d_camera_horizontal, self.d_camera_vertical,
+                self.d_sphere_centers, self.d_sphere_radii, 
+                self.d_sphere_materials, self.d_sphere_material_types,
+                self.d_sphere_roughness,  
+                self.d_triangle_vertices, self.d_triangle_uvs, 
+                self.d_triangle_materials, self.d_triangle_material_types,
+                self.d_triangle_roughness, 
+                self.d_texture_data, self.texture_dimensions, self.d_texture_indices,
+                self.d_accum_buffer, self.d_accum_buffer_sq, 
+                self.d_sample_count, self.d_mask, self.d_frame_output, d_depth_buffer,
+                self.frame_number, self.rng_states, self.N,
+                self.d_env_map, self.d_env_cdf, self.env_total, self.env_width, self.env_height,
+                self.d_halton_table_base2, self.d_halton_table_base3, self.d_halton_table_base5,
+                empty_array_3d, empty_array_3d, empty_array_1d, empty_array_1d, empty_array_1d, empty_array_1d, 0
+            )
+        else:
+            # Initialize texture indices if it's None
+            if not hasattr(self, 'd_texture_indices') or self.d_texture_indices is None:
+                print("Creating empty texture indices array")
+                self.d_texture_indices = cuda.to_device(np.zeros(1, dtype=np.int32))
+                
+            adaptive_render_kernel[self.blockspergrid, self.threadsperblock, stream](
+                self.width, self.height,
+                self.d_camera_origin, self.d_camera_lower_left,
+                self.d_camera_horizontal, self.d_camera_vertical,
+                self.d_sphere_centers, self.d_sphere_radii, 
+                self.d_sphere_materials, self.d_sphere_material_types,
+                self.d_sphere_roughness,  
+                self.d_triangle_vertices, self.d_triangle_uvs, 
+                self.d_triangle_materials, self.d_triangle_material_types,
+                self.d_triangle_roughness, 
+                self.d_texture_data, self.texture_dimensions, self.d_texture_indices,
+                self.d_accum_buffer, self.d_accum_buffer_sq, 
+                self.d_sample_count, self.d_mask, self.d_frame_output, d_depth_buffer,
+                self.frame_number, self.rng_states, self.N,
+                self.d_env_map, self.d_env_cdf, self.env_total, self.env_width, self.env_height,
+                self.d_halton_table_base2, self.d_halton_table_base3, self.d_halton_table_base5,
+                self.d_bvh_bbox_min, self.d_bvh_bbox_max, self.d_bvh_left, self.d_bvh_right, 
+                self.d_bvh_is_leaf, self.d_bvh_object_indices, num_nodes
+            )
         
         # --- Update Convergence Mask ---
         # Every 8 frames, update which pixels have converged
