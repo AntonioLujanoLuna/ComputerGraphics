@@ -373,16 +373,6 @@ class Renderer:
         cuda.to_device(camera_up, to=self.d_camera_up, stream=stream)
         cuda.to_device(np.array([curr_focus], dtype=np.float32), to=self.d_curr_focus, stream=stream)
         
-        # Transfer camera parameters to device
-        d_camera_origin = cuda.to_device(camera_origin, stream=stream)
-        d_camera_lower_left = cuda.to_device(camera_lower_left, stream=stream)
-        d_camera_horizontal = cuda.to_device(camera_horizontal, stream=stream)
-        d_camera_vertical = cuda.to_device(camera_vertical, stream=stream)
-        d_camera_forward = cuda.to_device(camera_forward, stream=stream)
-        d_camera_right = cuda.to_device(camera_right, stream=stream)
-        d_camera_up = cuda.to_device(camera_up, stream=stream)
-        d_curr_focus = cuda.to_device(np.array([curr_focus], dtype=np.float32), stream=stream)
-
         # Ensure depth buffer is allocated
         if self.d_prev_depth is None:
             host_depth = np.zeros((self.width, self.height), dtype=np.float32)
@@ -416,8 +406,8 @@ class Renderer:
                 self.d_prev_accum, self.d_prev_sample_count, self.d_prev_depth,
                 d_prev_cam_origin, d_prev_cam_lower_left, d_prev_cam_horizontal, d_prev_cam_vertical,
                 d_prev_cam_forward, d_prev_cam_right, d_prev_cam_up, d_prev_focus[0],
-                d_camera_origin, d_camera_lower_left, d_camera_horizontal, d_camera_vertical,
-                d_camera_forward, d_camera_right, d_camera_up, d_curr_focus[0],
+                self.d_camera_origin, self.d_camera_lower_left, self.d_camera_horizontal, self.d_camera_vertical,
+                self.d_camera_forward, self.d_camera_right, self.d_camera_up, self.d_curr_focus[0],
                 temp_accum, temp_sample_count
             )
             stream.synchronize()
@@ -435,8 +425,8 @@ class Renderer:
         # --- Launch Adaptive Render Kernel ---
         adaptive_render_kernel[self.blockspergrid, self.threadsperblock, stream](
             self.width, self.height,
-            d_camera_origin, d_camera_lower_left,
-            d_camera_horizontal, d_camera_vertical,
+            self.d_camera_origin, self.d_camera_lower_left,
+            self.d_camera_horizontal, self.d_camera_vertical,
             self.d_sphere_centers, self.d_sphere_radii, 
             self.d_sphere_materials, self.d_sphere_material_types,
             self.d_sphere_roughness,  
@@ -445,7 +435,7 @@ class Renderer:
             self.d_triangle_roughness, 
             self.d_texture_data, self.texture_dimensions, self.d_texture_indices,
             self.d_accum_buffer, self.d_accum_buffer_sq, 
-            self.d_sample_count, self.d_mask, d_frame_output, d_depth_buffer,
+            self.d_sample_count, self.d_mask, self.d_frame_output, d_depth_buffer,
             self.frame_number, self.rng_states, self.N,
             self.d_env_map, self.d_env_cdf, self.env_total, self.env_width, self.env_height,
             self.d_halton_table_base2, self.d_halton_table_base3, self.d_halton_table_base5,

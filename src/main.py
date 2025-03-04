@@ -44,6 +44,14 @@ class Application:
         self.screen = pygame.display.set_mode((self.window_width, self.window_height))
         pygame.display.set_caption("Real-Time Ray Tracer")
         
+        # Add quality settings
+        self.quality_levels = {
+            "interactive": {"samples": 2, "bounces": 2, "scale": 0.5},
+            "balanced": {"samples": 4, "bounces": 4, "scale": 0.75},
+            "high_quality": {"samples": 16, "bounces": 8, "scale": 1.0}
+        }
+        self.current_quality = "interactive"  # Start with interactive mode
+        
         # Initialize camera with depth of field
         self.aspect_ratio = self.window_width / self.window_height
         self.camera = Camera(
@@ -78,14 +86,6 @@ class Application:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 36)
         self.frame_count = 0
-
-        # Add quality settings
-        self.quality_levels = {
-            "interactive": {"samples": 2, "bounces": 2, "scale": 0.5},
-            "balanced": {"samples": 4, "bounces": 4, "scale": 0.75},
-            "high_quality": {"samples": 16, "bounces": 8, "scale": 1.0}
-        }
-        self.current_quality = "interactive"  # Start with interactive mode
     
     def apply_quality_settings(self):
         """
