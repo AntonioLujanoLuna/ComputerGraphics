@@ -21,9 +21,9 @@ def adaptive_render_kernel(width, height,
                            camera_origin, camera_lower_left,
                            camera_horizontal, camera_vertical,
                            sphere_centers, sphere_radii,
-                           sphere_materials, sphere_material_types,
+                           sphere_materials, sphere_material_types, sphere_roughness, 
                            triangle_vertices, triangle_uvs,
-                           triangle_materials, triangle_material_types,
+                           triangle_materials, triangle_material_types, triangle_roughness,
                            texture_data, texture_dimensions, texture_indices,
                            d_accum_buffer, d_accum_buffer_sq,
                            d_sample_count, d_mask, d_frame_output, d_depth_buffer,
@@ -129,16 +129,14 @@ def adaptive_render_kernel(width, height,
 
         # Trace ray with improved function
         trace_ray(ray_origin, ray_dir, MAX_BOUNCES,
-                  sphere_centers, sphere_radii,
-                  sphere_materials, sphere_material_types,
-                  triangle_vertices, triangle_uvs,
-                  triangle_materials, triangle_material_types,
-                  texture_data, texture_dimensions, texture_indices,
-                  sample_col, sample_depth,
-                  rng_states, pixel_idx * N + s,
-                  d_env_map, d_env_cdf, env_total, env_width, env_height,
-                  bbox_min, bbox_max, left_indices, right_indices, 
-                  is_leaf, object_indices, num_nodes)
+            sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
+            sphere_roughness, triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types,
+            triangle_roughness, texture_data, texture_dimensions, texture_indices,
+            sample_col, sample_depth,
+            rng_states, pixel_idx * N + s,
+            d_env_map, d_env_cdf, env_total, env_width, env_height,
+            bbox_min, bbox_max, left_indices, right_indices, 
+            is_leaf, object_indices, num_nodes)
 
         # Accumulate color and keep track of minimum depth
         for i in range(3):
@@ -322,8 +320,8 @@ def compute_variance_kernel(accum_buffer, accum_buffer_sq, samples, out_mask):
 
 @cuda.jit(device=True)
 def trace_ray(origin, direction, max_bounces,
-              sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
-              triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types,
+              sphere_centers, sphere_radii, sphere_materials, sphere_material_types, sphere_roughness, 
+              triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types, triangle_roughness,
               texture_data, texture_dimensions, texture_indices,
               out_color, out_depth,
               rng_states, thread_id,
@@ -490,7 +488,7 @@ def trace_ray(origin, direction, max_bounces,
                 mat_color[i] = sphere_materials[base_idx + i]
             # For microfacet materials, get roughness from material properties
             if mat_type == 4:  # MicrofacetMetal
-                roughness = sphere_materials[base_idx + 3] if base_idx + 3 < sphere_materials.shape[0] else 0.1
+                roughness = sphere_roughness[hit_idx]
             # Compute sphere UV coordinates (if needed for texturing)
             calculate_sphere_uv(tmp_hit_pt, center, uv_coords)
         else:
@@ -505,7 +503,7 @@ def trace_ray(origin, direction, max_bounces,
                 mat_color[i] = triangle_materials[base_idx + i]
             # For microfacet materials, get roughness from material properties
             if mat_type == 4:  # MicrofacetMetal
-                roughness = triangle_materials[base_idx + 3] if base_idx + 3 < triangle_materials.shape[0] else 0.1
+                roughness = triangle_roughness[hit_idx]
 
         normalize_inplace(hit_normal)
 
@@ -552,7 +550,7 @@ def trace_ray(origin, direction, max_bounces,
         # --- BSDF sampling for the next bounce ---
         scatter_dir = cuda.local.array(3, dtype=float32)
         valid_scatter = bsdf_sample(mat_type, current_dir, hit_normal, mat_color, ior_val, roughness,
-                                    rng_states, thread_id, scatter_dir)
+                           rng_states, thread_id, scatter_dir)
         if not valid_scatter:
             alive = 0
             continue

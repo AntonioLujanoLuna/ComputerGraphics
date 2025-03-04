@@ -118,14 +118,20 @@ class Renderer:
                 if self.d_texture_data is not None:
                     del self.d_texture_data
                     del self.d_texture_indices
+            if hasattr(self, 'd_sphere_roughness') and self.d_sphere_roughness is not None:
+                del self.d_sphere_roughness
+            if hasattr(self, 'd_triangle_roughness') and self.d_triangle_roughness is not None:
+                del self.d_triangle_roughness
             self.d_sphere_centers = None
             self.d_sphere_radii = None
             self.d_sphere_materials = None
             self.d_sphere_material_types = None
+            self.d_sphere_roughness = None
             self.d_triangle_vertices = None
             self.d_triangle_uvs = None
             self.d_triangle_materials = None
             self.d_triangle_material_types = None
+            self.d_triangle_roughness = None
             self.d_texture_data = None
             self.d_texture_indices = None
             self.texture_dimensions = None
@@ -148,6 +154,7 @@ class Renderer:
         radii = np.zeros(max(1, sphere_count), dtype=np.float32)
         sphere_materials = np.zeros(max(1, sphere_count) * 3, dtype=np.float32)
         sphere_material_types = np.zeros(max(1, sphere_count), dtype=np.int32)
+        sphere_roughness = np.zeros(max(1, sphere_count), dtype=np.float32)
 
         # Initialize texture arrays with default values even if no textures exist
         texture_data = np.zeros(1, dtype=np.float32)  # Minimal default texture
@@ -172,18 +179,20 @@ class Renderer:
                     emission = mat.emitted(0, 0, obj.center)
                     sphere_materials[mat_idx:mat_idx+3] = [emission.x, emission.y, emission.z]
                     sphere_material_types[sphere_idx] = 2  # Emissive
+                    sphere_roughness[sphere_idx] = 0.0
                 elif isinstance(mat, Metal):
                     if hasattr(mat, 'texture') and mat.texture is not None:
                         sphere_materials[mat_idx:mat_idx+3] = [mat.texture.color.x, mat.texture.color.y, mat.texture.color.z]
                     sphere_material_types[sphere_idx] = 1  # Metal
+                    sphere_roughness[sphere_idx] = mat.fuzz if hasattr(mat, 'fuzz') else 0.1
                 elif isinstance(mat, Dielectric):
                     sphere_materials[mat_idx:mat_idx+3] = [mat.ref_idx, 0.0, 0.0]
                     sphere_material_types[sphere_idx] = 3  # Dielectric
+                    sphere_roughness[sphere_idx] = 0.0
                 elif isinstance(mat, MicrofacetMetal):
                     sphere_materials[mat_idx:mat_idx+3] = [mat.albedo.x, mat.albedo.y, mat.albedo.z]
-                    # Store roughness in a separate parameter or in the 4th component
-                    sphere_roughness[sphere_idx] = mat.roughness
                     sphere_material_types[sphere_idx] = 4  # MicrofacetMetal
+                    sphere_roughness[sphere_idx] = mat.roughness
                 else:
                     if hasattr(mat, 'texture') and mat.texture is not None:
                         if hasattr(mat.texture, 'color'):
@@ -192,12 +201,14 @@ class Renderer:
                             color = mat.texture.sample(UV(0.5, 0.5))
                             sphere_materials[mat_idx:mat_idx+3] = [color.x, color.y, color.z]
                     sphere_material_types[sphere_idx] = 0  # Lambertian or other
+                    sphere_roughness[sphere_idx] = 0.0
                 sphere_idx += 1
 
         triangle_vertices = np.zeros((max(1, triangle_count), 9), dtype=np.float32)
         triangle_uvs = np.zeros((max(1, triangle_count), 6), dtype=np.float32)
         triangle_materials = np.zeros((max(1, triangle_count) * 3), dtype=np.float32)
         triangle_material_types = np.zeros((max(1, triangle_count)), dtype=np.int32)
+        triangle_roughness = np.zeros(max(1, triangle_count), dtype=np.float32)
 
         triangle_idx = 0
         for mesh in mesh_objects:
@@ -218,6 +229,7 @@ class Renderer:
                     if hasattr(mat, 'texture') and mat.texture is not None:
                         triangle_materials[mat_idx:mat_idx+3] = [mat.texture.color.x, mat.texture.color.y, mat.texture.color.z]
                     triangle_material_types[triangle_idx] = 1
+                    triangle_roughness[triangle_idx] = mat.roughness
                 else:
                     if hasattr(mat, 'texture') and mat.texture is not None:
                         if hasattr(mat.texture, 'color'):
@@ -225,6 +237,7 @@ class Renderer:
                         else:
                             color = mat.texture.sample(UV(0.5, 0.5))
                             triangle_materials[mat_idx:mat_idx+3] = [color.x, color.y, color.z]
+                            triangle_roughness[triangle_idx] = mat.roughness
                     triangle_material_types[triangle_idx] = 0
                 triangle_idx += 1
 
@@ -232,10 +245,12 @@ class Renderer:
         self.d_sphere_radii = cuda.to_device(np.ascontiguousarray(radii))
         self.d_sphere_materials = cuda.to_device(np.ascontiguousarray(sphere_materials))
         self.d_sphere_material_types = cuda.to_device(np.ascontiguousarray(sphere_material_types))
+        self.d_sphere_roughness = cuda.to_device(np.ascontiguousarray(sphere_roughness))
         self.d_triangle_vertices = cuda.to_device(np.ascontiguousarray(triangle_vertices))
         self.d_triangle_uvs = cuda.to_device(np.ascontiguousarray(triangle_uvs))
         self.d_triangle_materials = cuda.to_device(np.ascontiguousarray(triangle_materials))
         self.d_triangle_material_types = cuda.to_device(np.ascontiguousarray(triangle_material_types))
+        self.d_triangle_roughness = cuda.to_device(np.ascontiguousarray(triangle_roughness))
 
         textures = set()
         for obj in world.objects:
@@ -388,8 +403,10 @@ class Renderer:
             d_camera_horizontal, d_camera_vertical,
             self.d_sphere_centers, self.d_sphere_radii, 
             self.d_sphere_materials, self.d_sphere_material_types,
+            self.d_sphere_roughness,  
             self.d_triangle_vertices, self.d_triangle_uvs, 
             self.d_triangle_materials, self.d_triangle_material_types,
+            self.d_triangle_roughness, 
             self.d_texture_data, self.texture_dimensions, self.d_texture_indices,
             self.d_accum_buffer, self.d_accum_buffer_sq, 
             self.d_sample_count, self.d_mask, d_frame_output, d_depth_buffer,
