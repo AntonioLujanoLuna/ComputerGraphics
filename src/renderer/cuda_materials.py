@@ -1,7 +1,7 @@
 # renderer/cuda_materials.py
 
 from numba import cuda, float32
-from .cuda_utils import dot, normalize_inplace, random_in_unit_sphere
+from .cuda_utils import dot, normalize_inplace, random_in_unit_sphere, cross_inplace
 from numba.cuda.random import xoroshiro128p_uniform_float32
 import math
 

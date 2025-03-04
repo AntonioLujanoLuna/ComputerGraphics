@@ -1,6 +1,6 @@
 # renderer/cuda_geometry.py
 
-from numba import cuda, float32
+from numba import cuda, float32, int32
 from .cuda_utils import dot, cross_inplace, normalize_inplace
 import math
 
@@ -148,9 +148,11 @@ def gpu_bvh_traverse(ray_origin, ray_dir,
                      bbox_min, bbox_max,
                      left_indices, right_indices,
                      is_leaf, object_indices, num_nodes,
-                     t_min, t_max):
+                     t_min, t_max,
+                     sphere_centers, sphere_radii,
+                     triangle_vertices, uv_temp):
     # Use a fixed-size local stack.
-    stack = cuda.local.array(64, dtype=cuda.int32)
+    stack = cuda.local.array(64, dtype=int32)
     stack_ptr = 0
     hit_object = -1
     hit_t = t_max
@@ -185,10 +187,10 @@ def gpu_bvh_traverse(ray_origin, ray_dir,
                     tri_idx = obj_idx - sphere_count
                     uv = cuda.local.array(2, dtype=float32)
                     t = ray_triangle_intersect(ray_origin, ray_dir,
-                                              triangle_vertices[tri_idx, 0:3],
-                                              triangle_vertices[tri_idx, 3:6],
-                                              triangle_vertices[tri_idx, 6:9],
-                                              t_min, hit_t, uv)
+                          triangle_vertices[tri_idx, 0:3],
+                          triangle_vertices[tri_idx, 3:6],
+                          triangle_vertices[tri_idx, 6:9],
+                          t_min, hit_t, uv_temp)
                     if t > 0.0 and t < hit_t:
                         hit_t = t
                         hit_object = obj_idx
