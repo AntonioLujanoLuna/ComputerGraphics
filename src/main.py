@@ -56,11 +56,15 @@ class Application:
             focus_dist=8.0   # Focus on the scene center
         )
         
-        # Initialize renderer with higher bounce depth
+        # Initialize with quality settings
+        quality = self.quality_levels[self.current_quality]
+        self.render_scale = quality["scale"]
+        self.update_render_resolution()
         self.renderer = Renderer(
             self.render_width,
             self.render_height,
-            max_depth=MAX_BOUNCES
+            N=quality["samples"],
+            max_depth=quality["bounces"]
         )
         
         # Movement and rotation speeds
@@ -74,7 +78,37 @@ class Application:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 36)
         self.frame_count = 0
+
+        # Add quality settings
+        self.quality_levels = {
+            "interactive": {"samples": 2, "bounces": 2, "scale": 0.5},
+            "balanced": {"samples": 4, "bounces": 4, "scale": 0.75},
+            "high_quality": {"samples": 16, "bounces": 8, "scale": 1.0}
+        }
+        self.current_quality = "interactive"  # Start with interactive mode
     
+    def apply_quality_settings(self):
+        """
+        Apply the current quality settings by updating render scale and renderer parameters.
+        This resets the renderer accumulation to start a fresh render.
+        """
+        quality = self.quality_levels[self.current_quality]
+        self.render_scale = quality["scale"]
+        self.update_render_resolution()
+        
+        # Create new renderer with quality settings
+        self.renderer = Renderer(
+            self.render_width,
+            self.render_height,
+            N=quality["samples"],
+            max_depth=quality["bounces"]
+        )
+        
+        # Update scene data and reset accumulation
+        self.renderer.update_scene_data(self.world)
+        self.renderer.reset_accumulation()
+        print(f"Quality changed to: {self.current_quality}")
+
     def cleanup(self):
         if hasattr(self, 'renderer'):
             self.renderer.cleanup()
@@ -134,6 +168,21 @@ class Application:
         
         # Update camera orientation and viewport
         self.camera.update_camera()
+
+        # Add quality toggle with number keys
+        keys = pygame.key.get_pressed()
+        if keys[pygame.K_1] and self.current_quality != "interactive":
+            self.current_quality = "interactive"
+            self.apply_quality_settings()
+            return True
+        elif keys[pygame.K_2] and self.current_quality != "balanced":
+            self.current_quality = "balanced"
+            self.apply_quality_settings()
+            return True
+        elif keys[pygame.K_3] and self.current_quality != "high_quality":
+            self.current_quality = "high_quality"
+            self.apply_quality_settings()
+            return True
         
         return moved
 
@@ -171,20 +220,45 @@ class Application:
                         elif event.key == pygame.K_SPACE:
                             # Reset accumulation on space press
                             self.renderer.reset_accumulation()
-                
+                        elif event.key == pygame.K_f:
+                            # Quick low quality mode for faster navigation
+                            print("Switching to fast navigation mode")
+                            old_quality = self.current_quality
+                            self.current_quality = "interactive"
+                            self.apply_quality_settings()
+                            
+                            # Reduce resolution even further for very fast preview
+                            temp_scale = self.render_scale
+                            self.render_scale = 0.25
+                            self.update_render_resolution()
+                            self.renderer = Renderer(
+                                self.render_width,
+                                self.render_height,
+                                N=1,  # Minimal samples
+                                max_depth=1  # Minimal bounces
+                            )
+                            self.renderer.update_scene_data(self.world)
+                    
                 # Only update camera if mouse/keyboard input detected
                 if self.handle_input(dt):
                     self.renderer.reset_accumulation()
                 
                 # Render frame
                 image = self.renderer.render_frame_adaptive(self.camera, self.world)
-                #mapped_image = reinhard_tone_mapping(image, exposure=1.0, white_point=1.0, gamma=2.2)
                 mapped_image = reinhard_tone_mapping(image, exposure=2.0, white_point=2.0, gamma=2.2)
                 surf = pygame.surfarray.make_surface(mapped_image)
                 
                 if self.render_width != self.window_width or self.render_height != self.window_height:
                     surf = pygame.transform.scale(surf, (self.window_width, self.window_height))
                 self.screen.blit(surf, (0, 0))
+                
+                # Calculate and display FPS
+                current_fps = self.clock.get_fps()
+                self.display_performance_metrics(current_fps)
+                
+                # Adjust render resolution based on performance
+                if self.frame_count % 30 == 0:  # Check every 30 frames
+                    self.adjust_render_scale(current_fps)
                 
                 # Show sample count, update display, etc.
                 pygame.display.flip()
@@ -296,15 +370,30 @@ class Application:
         return world
     
     def display_performance_metrics(self, fps: float):
-        """Display FPS and other performance information."""
+        """
+        Display FPS, resolution, and quality setting information on screen.
+        
+        Args:
+            fps: Current frames per second value
+        """
         fps_text = self.font.render(f"FPS: {int(fps)}", True, (255, 255, 255))
         res_text = self.font.render(
             f"Resolution: {self.render_width}x{self.render_height} ({int(self.render_scale*100)}%)", 
             True, (255, 255, 255)
         )
+        quality_text = self.font.render(
+            f"Quality: {self.current_quality} (Press 1/2/3 to change)", 
+            True, (255, 255, 255)
+        )
+        sample_text = self.font.render(
+            f"Samples: {self.quality_levels[self.current_quality]['samples']}, Bounces: {self.quality_levels[self.current_quality]['bounces']}", 
+            True, (255, 255, 255)
+        )
         
         self.screen.blit(fps_text, (10, 10))
         self.screen.blit(res_text, (10, 50))
+        self.screen.blit(quality_text, (10, 90))
+        self.screen.blit(sample_text, (10, 130))
 
 def main():
     # Force CUDA initialization and check

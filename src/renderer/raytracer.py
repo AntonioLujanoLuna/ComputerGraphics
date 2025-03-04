@@ -17,7 +17,7 @@ from renderer.cuda_utils import MAX_HALTON_SAMPLES, precompute_halton_tables
 # CUDA device constants
 INFINITY = float32(1e20)
 EPSILON = float32(1e-20)
-MAX_BOUNCES = 16
+MAX_BOUNCES = 4
 
 class Renderer:    
     def __init__(self, width: int, height: int, N: int = 16, max_depth: int = 4, debug_mode: bool = False):
@@ -87,6 +87,20 @@ class Renderer:
         self.d_halton_table_base3 = cuda.to_device(halton_table_base3_host)
         self.d_halton_table_base5 = cuda.to_device(halton_table_base5_host)
 
+        # Pre-allocate CUDA buffers for camera parameters
+        self.d_camera_origin = cuda.to_device(np.zeros(3, dtype=np.float32))
+        self.d_camera_lower_left = cuda.to_device(np.zeros(3, dtype=np.float32))
+        self.d_camera_horizontal = cuda.to_device(np.zeros(3, dtype=np.float32))
+        self.d_camera_vertical = cuda.to_device(np.zeros(3, dtype=np.float32))
+        self.d_camera_forward = cuda.to_device(np.zeros(3, dtype=np.float32))
+        self.d_camera_right = cuda.to_device(np.zeros(3, dtype=np.float32))
+        self.d_camera_up = cuda.to_device(np.zeros(3, dtype=np.float32))
+        self.d_curr_focus = cuda.to_device(np.zeros(1, dtype=np.float32))
+
+        # Pre-allocate output buffer
+        self.d_frame_output = cuda.to_device(np.zeros((width, height, 3), dtype=np.float32))
+        self.frame_output = cuda.pinned_array((width, height, 3), dtype=np.float32)
+
         self.reset_accumulation()
 
     def load_textures(self, textures: list):
@@ -139,6 +153,19 @@ class Renderer:
             self.d_accum_buffer_sq = None
             self.d_sample_count = None
             self.d_mask = None
+
+            # Clean up pre-allocated buffers
+            if hasattr(self, 'd_camera_origin') and self.d_camera_origin is not None:
+                del self.d_camera_origin
+                del self.d_camera_lower_left
+                del self.d_camera_horizontal
+                del self.d_camera_vertical
+                del self.d_camera_forward
+                del self.d_camera_right
+                del self.d_camera_up
+                del self.d_curr_focus
+                del self.d_frame_output
+
         except Exception as e:
             print(f"Warning: Error during CUDA cleanup: {str(e)}")
 
@@ -302,6 +329,9 @@ class Renderer:
         Returns:
             np.ndarray: Rendered image of shape (width, height, 3) with float32 values
         """
+        # Create CUDA stream for asynchronous operations
+        stream = cuda.stream()
+
         # Set up current camera parameters
         camera_origin = np.array(
             [camera.position.x, camera.position.y, camera.position.z],
@@ -333,8 +363,15 @@ class Renderer:
         )
         curr_focus = camera.focus_dist
 
-        # Create CUDA stream for asynchronous operations
-        stream = cuda.stream()
+        # Transfer camera parameters to pre-allocated device memory
+        cuda.to_device(camera_origin, to=self.d_camera_origin, stream=stream)
+        cuda.to_device(camera_lower_left, to=self.d_camera_lower_left, stream=stream)
+        cuda.to_device(camera_horizontal, to=self.d_camera_horizontal, stream=stream)
+        cuda.to_device(camera_vertical, to=self.d_camera_vertical, stream=stream)
+        cuda.to_device(camera_forward, to=self.d_camera_forward, stream=stream)
+        cuda.to_device(camera_right, to=self.d_camera_right, stream=stream)
+        cuda.to_device(camera_up, to=self.d_camera_up, stream=stream)
+        cuda.to_device(np.array([curr_focus], dtype=np.float32), to=self.d_curr_focus, stream=stream)
         
         # Transfer camera parameters to device
         d_camera_origin = cuda.to_device(camera_origin, stream=stream)
@@ -354,9 +391,8 @@ class Renderer:
         # Allocate current frame's depth buffer
         d_depth_buffer = cuda.to_device(np.zeros((self.width, self.height), dtype=np.float32), stream=stream)
 
-        # Allocate output image buffer
-        frame_output = cuda.pinned_array((self.width, self.height, 3), dtype=np.float32)
-        d_frame_output = cuda.to_device(frame_output, stream=stream)
+        # Reset output buffer - no need to reallocate
+        self.d_frame_output.copy_to_device(np.zeros((self.width, self.height, 3), dtype=np.float32), stream=stream)
 
         # --- Temporal Reprojection Step ---
         # If we have a previous frame and camera parameters, reproject data
@@ -435,7 +471,7 @@ class Renderer:
         stream.synchronize()
 
         # Copy the result to host memory
-        frame_output = d_frame_output.copy_to_host(stream=stream)
+        self.d_frame_output.copy_to_host(self.frame_output, stream=stream)
         stream.synchronize()
         
         # Increment frame counter
@@ -456,7 +492,7 @@ class Renderer:
         self.d_prev_sample_count = self.d_sample_count
         self.d_prev_depth = d_depth_buffer
 
-        return frame_output
+        return self.frame_output
 
     def reset_accumulation(self):
         """Reset all accumulation buffers (current and previous) when the scene or camera changes."""
