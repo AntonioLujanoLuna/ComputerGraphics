@@ -6,7 +6,8 @@ from numba.cuda.random import xoroshiro128p_uniform_float32
 from .cuda_utils import dot, normalize_inplace, halton, compute_env_pdf, mis_power_heuristic, sample_cosine_hemisphere, halton_cached
 from .cuda_geometry import (
     ray_sphere_intersect, calculate_sphere_uv, 
-    ray_triangle_intersect, compute_triangle_normal
+    ray_triangle_intersect, compute_triangle_normal,
+    gpu_bvh_traverse
 )
 from .cuda_env import eval_env_map, sample_env_importance
 from .cuda_bsdf import bsdf_pdf, bsdf_sample, update_scatter_attenuation, scene_occlusion_test
