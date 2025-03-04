@@ -96,16 +96,33 @@ class Application:
         self.render_scale = quality["scale"]
         self.update_render_resolution()
         
-        # Create new renderer with quality settings
-        self.renderer = Renderer(
-            self.render_width,
-            self.render_height,
-            N=quality["samples"],
-            max_depth=quality["bounces"]
-        )
+        # If renderer already exists, update its parameters rather than recreating
+        if hasattr(self, 'renderer'):
+            old_width = self.renderer.width
+            old_height = self.renderer.height
+            
+            # Create new renderer with quality settings
+            self.renderer = Renderer(
+                self.render_width,
+                self.render_height,
+                N=quality["samples"],
+                max_depth=quality["bounces"]
+            )
+            
+            # Important: Update scene data in the new renderer
+            self.renderer.update_scene_data(self.world)
+            print(f"Scene data updated after quality change")
+        else:
+            # First-time initialization
+            self.renderer = Renderer(
+                self.render_width,
+                self.render_height,
+                N=quality["samples"],
+                max_depth=quality["bounces"]
+            )
+            self.renderer.update_scene_data(self.world)
         
-        # Update scene data and reset accumulation
-        self.renderer.update_scene_data(self.world)
+        # Reset accumulation to start fresh render
         self.renderer.reset_accumulation()
         print(f"Quality changed to: {self.current_quality}")
 
@@ -270,14 +287,32 @@ class Application:
         
     def update_render_resolution(self):
         """Update render resolution based on current scale."""
+        old_width = self.render_width if hasattr(self, 'render_width') else 0 
+        old_height = self.render_height if hasattr(self, 'render_height') else 0
+        
+        # Calculate new resolution
         self.render_width = max(32, int(self.window_width * self.render_scale))
         self.render_height = max(32, int(self.window_height * self.render_scale))
-        if hasattr(self, 'renderer'):
-            self.renderer = Renderer(
-                self.render_width,
-                self.render_height,
-                self.renderer.max_depth
-            )
+        
+        # Only recreate renderer if resolution actually changed
+        if self.render_width != old_width or self.render_height != old_height:
+            print(f"Updating render resolution: {old_width}x{old_height} -> {self.render_width}x{self.render_height}")
+            if hasattr(self, 'renderer'):
+                # Store current settings
+                old_N = self.renderer.N if hasattr(self.renderer, 'N') else 4
+                old_max_depth = self.renderer.max_depth
+                
+                # Create new renderer with the same settings but new resolution
+                self.renderer = Renderer(
+                    self.render_width,
+                    self.render_height,
+                    N=old_N,
+                    max_depth=old_max_depth
+                )
+                
+                # Important: Update scene data in the new renderer
+                self.renderer.update_scene_data(self.world)
+                print(f"Scene data updated after resolution change")
     
     def adjust_render_scale(self, current_fps):
         """Dynamically adjust render scale based on performance."""
