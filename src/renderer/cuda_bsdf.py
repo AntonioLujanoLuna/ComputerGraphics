@@ -2,32 +2,27 @@
 
 from numba import cuda, float32
 import math
-from .cuda_materials import scatter_dielectric, scatter_lambertian, scatter_metal
+from .cuda_materials import scatter_dielectric, scatter_lambertian, scatter_metal, scatter_microfacet_metal
 from .cuda_utils import dot
 from .cuda_geometry import ray_sphere_intersect, ray_triangle_intersect
 
 
 @cuda.jit(device=True)
-def bsdf_sample(mat_type, incoming, normal, mat_color, ior, rng_states, thread_id, out_scatter):
+def bsdf_sample(mat_type, incoming, normal, mat_color, ior, roughness, rng_states, thread_id, out_scatter):
     """
     Sample the BSDF based on material type.
     
     Parameters:
-      mat_type: Material type identifier (0: Lambertian, 1: Metal, 3: Dielectric)
-      incoming: 3-element array for the incoming ray direction.
-      normal:   3-element array for the surface normal at the hit point.
-      mat_color: 3-element array representing the material’s color or albedo.
-      ior:       Index of refraction (for dielectrics).
-      rng_states, thread_id: Random number generator state and thread index.
-      out_scatter: Output 3-element array for the sampled direction.
-      
-    Returns:
-      True if scattering occurred, False otherwise.
+      mat_type: Material type identifier 
+        (0: Lambertian, 1: Metal, 2: Emissive, 3: Dielectric, 4: MicrofacetMetal)
+      ...
     """
     if mat_type == 1:
         return scatter_metal(incoming, normal, mat_color, rng_states, thread_id, out_scatter)
     elif mat_type == 3:
         return scatter_dielectric(incoming, normal, ior, rng_states, thread_id, out_scatter)
+    elif mat_type == 4:  # MicrofacetMetal
+        return scatter_microfacet_metal(incoming, normal, mat_color, roughness, rng_states, thread_id, out_scatter)
     else:
         # Default to Lambertian scattering.
         return scatter_lambertian(normal, rng_states, thread_id, out_scatter)

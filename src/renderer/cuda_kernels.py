@@ -26,25 +26,49 @@ def adaptive_render_kernel(width, height,
                            triangle_materials, triangle_material_types,
                            texture_data, texture_dimensions, texture_indices,
                            d_accum_buffer, d_accum_buffer_sq,
-                           d_sample_count, d_mask, d_frame_output,
+                           d_sample_count, d_mask, d_frame_output, d_depth_buffer,
                            frame_number, rng_states, N,
                            d_env_map, d_env_cdf, env_total, env_width, env_height,
-                           d_halton_table_base2, d_halton_table_base3, d_halton_table_base5):
+                           d_halton_table_base2, d_halton_table_base3, d_halton_table_base5,
+                           bbox_min=None, bbox_max=None, left_indices=None, right_indices=None, 
+                           is_leaf=None, object_indices=None, num_nodes=0):
     """
-    An adaptive path tracing kernel that:
-      1) Skips already converged pixels (d_mask[x,y]==1)
-      2) Does multiple samples per pixel
-      3) Calls trace_ray(...) for each sample
-      4) Accumulates color in d_accum_buffer
-      5) Writes the final average to d_frame_output
-
-    Added parameters for environment sampling and MIS:
-      d_env_map, d_env_cdf, env_total, env_width, env_height
+    CUDA kernel for adaptive path tracing with BVH acceleration and temporal reprojection support.
+    
+    This kernel:
+    1. Skips already converged pixels (d_mask[x,y]==1)
+    2. Traces multiple samples per pixel with stratified sampling
+    3. Accumulates color and variance for adaptive sampling
+    4. Stores depth values for temporal reprojection
+    5. Uses BVH acceleration structure when available
+    
+    Parameters:
+        width, height (int): Image dimensions
+        camera_origin (float32[3]): Camera position
+        camera_lower_left (float32[3]): Lower left corner of camera viewport
+        camera_horizontal (float32[3]): Horizontal span of camera viewport
+        camera_vertical (float32[3]): Vertical span of camera viewport
+        sphere_centers, sphere_radii, sphere_materials, sphere_material_types: Scene sphere data
+        triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types: Scene triangle data
+        texture_data, texture_dimensions, texture_indices: Texture information
+        d_accum_buffer (float32[width,height,3]): Accumulated color buffer
+        d_accum_buffer_sq (float32[width,height,3]): Accumulated squared color buffer (for variance)
+        d_sample_count (int32[width,height]): Sample count per pixel
+        d_mask (int32[width,height]): Convergence mask (1=converged)
+        d_frame_output (float32[width,height,3]): Output color buffer
+        d_depth_buffer (float32[width,height]): Output depth buffer for temporal reprojection
+        frame_number (int): Current frame number
+        rng_states: CUDA random number generator states
+        N (int): Number of samples per pixel for this frame
+        d_env_map, d_env_cdf, env_total, env_width, env_height: Environment map data
+        d_halton_table_base2, d_halton_table_base3, d_halton_table_base5: Precomputed Halton sequences
+        bbox_min, bbox_max, left_indices, right_indices, is_leaf, object_indices, num_nodes: BVH data
     """
     x, y = cuda.grid(2)
     if x >= width or y >= height:
         return
 
+    # Skip pixels that have already converged
     if d_mask[x, y] == 1:
         count = d_sample_count[x, y]
         if count > 0:
@@ -60,22 +84,30 @@ def adaptive_render_kernel(width, height,
             d_frame_output[x, y, 2] = 0.0
         return
 
+    # Initialize local accumulators
     local_color = cuda.local.array(3, dtype=float32)
+    local_depth = cuda.local.array(1, dtype=float32)
     for i in range(3):
         local_color[i] = 0.0
+    local_depth[0] = 1e20  # Initialize to far distance
 
     pixel_idx = x + y * width
 
+    # Generate N samples for this pixel with stratified sampling
     for s in range(N):
         seq_idx = frame_number * N + s
 
-        # Use the precomputed Halton values to obtain jitter offsets.
-        jitter_x = halton_cached(pixel_idx * 4096 + seq_idx, 2, d_halton_table_base2, d_halton_table_base3, d_halton_table_base5) / width
-        jitter_y = halton_cached(pixel_idx * 4096 + seq_idx, 3, d_halton_table_base2, d_halton_table_base3, d_halton_table_base5) / height
+        # Use the precomputed Halton values for stratified sampling
+        jitter_x = halton_cached(pixel_idx * 4096 + seq_idx, 2, 
+                                d_halton_table_base2, d_halton_table_base3, d_halton_table_base5) / width
+        jitter_y = halton_cached(pixel_idx * 4096 + seq_idx, 3, 
+                                d_halton_table_base2, d_halton_table_base3, d_halton_table_base5) / height
 
+        # Compute normalized device coordinates
         u = (float32(x) + jitter_x) / float32(width - 1)
         v = 1.0 - ((float32(y) + jitter_y) / float32(height - 1))
 
+        # Generate ray
         ray_origin = cuda.local.array(3, dtype=float32)
         ray_dir = cuda.local.array(3, dtype=float32)
         for i in range(3):
@@ -84,31 +116,43 @@ def adaptive_render_kernel(width, height,
                           u * camera_horizontal[i] +
                           v * camera_vertical[i] -
                           camera_origin[i])
-        # Call the helper function (assumed imported at module level)
+
+        # Normalize ray direction
         normalize_inplace(ray_dir)
 
+        # Local arrays for sample color and depth
         sample_col = cuda.local.array(3, dtype=float32)
+        sample_depth = cuda.local.array(1, dtype=float32)
         for i in range(3):
             sample_col[i] = 0.0
+        sample_depth[0] = 1e20
 
-        # Call the path–tracing routine (using your optimized trace_ray)
+        # Trace ray with improved function
         trace_ray(ray_origin, ray_dir, MAX_BOUNCES,
                   sphere_centers, sphere_radii,
                   sphere_materials, sphere_material_types,
                   triangle_vertices, triangle_uvs,
                   triangle_materials, triangle_material_types,
                   texture_data, texture_dimensions, texture_indices,
-                  sample_col,
+                  sample_col, sample_depth,
                   rng_states, pixel_idx * N + s,
-                  d_env_map, d_env_cdf, env_total, env_width, env_height)
+                  d_env_map, d_env_cdf, env_total, env_width, env_height,
+                  bbox_min, bbox_max, left_indices, right_indices, 
+                  is_leaf, object_indices, num_nodes)
 
+        # Accumulate color and keep track of minimum depth
         for i in range(3):
             local_color[i] += sample_col[i]
+        
+        if sample_depth[0] < local_depth[0]:
+            local_depth[0] = sample_depth[0]
 
+    # Average the samples for this frame
     invN = 1.0 / float32(N)
     for i in range(3):
         local_color[i] *= invN
 
+    # Atomic additions to the accumulation buffers
     cuda.atomic.add(d_accum_buffer, (x, y, 0), local_color[0])
     cuda.atomic.add(d_accum_buffer, (x, y, 1), local_color[1])
     cuda.atomic.add(d_accum_buffer, (x, y, 2), local_color[2])
@@ -117,6 +161,11 @@ def adaptive_render_kernel(width, height,
     cuda.atomic.add(d_accum_buffer_sq, (x, y, 2), local_color[2] * local_color[2])
     cuda.atomic.add(d_sample_count, (x, y), N)
 
+    # Store depth for temporal reprojection
+    if local_depth[0] < 1e20:
+        d_depth_buffer[x, y] = local_depth[0]
+
+    # Compute current average for display
     count_after = d_sample_count[x, y]
     if count_after > 0:
         avg_r = d_accum_buffer[x, y, 0] / float32(count_after)
@@ -273,42 +322,71 @@ def compute_variance_kernel(accum_buffer, accum_buffer_sq, samples, out_mask):
 
 @cuda.jit(device=True)
 def trace_ray(origin, direction, max_bounces,
-                        sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
-                        triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types,
-                        texture_data, texture_dimensions, texture_indices,
-                        out_color,
-                        rng_states, thread_id,
-                        d_env_map, d_env_cdf, env_total, env_width, env_height):
+              sphere_centers, sphere_radii, sphere_materials, sphere_material_types,
+              triangle_vertices, triangle_uvs, triangle_materials, triangle_material_types,
+              texture_data, texture_dimensions, texture_indices,
+              out_color, out_depth,
+              rng_states, thread_id,
+              d_env_map, d_env_cdf, env_total, env_width, env_height,
+              bbox_min=None, bbox_max=None, left_indices=None, right_indices=None, 
+              is_leaf=None, object_indices=None, num_nodes=0):
     """
-    Optimized path–tracing loop with reduced branch divergence.
+    Optimized path-tracing function with BVH acceleration and depth tracking.
     
-    Changes include:
-      • Using a fixed number of iterations (max_bounces) and an "alive" flag
-        instead of break statements.
-      • Combining certain conditional tests (for example, flipping the normal)
-        into a more uniform code path.
-      • Minimizing repeated global memory accesses by keeping key values in registers.
+    Parameters:
+        origin (float32[3]): Ray origin point
+        direction (float32[3]): Ray direction vector
+        max_bounces (int): Maximum number of ray bounces
+        sphere_centers (float32[n,3]): Array of sphere center coordinates
+        sphere_radii (float32[n]): Array of sphere radii
+        sphere_materials (float32[n*3]): Array of material properties for spheres
+        sphere_material_types (int32[n]): Material type identifiers for spheres
+        triangle_vertices (float32[m,9]): Array of triangle vertices (three vertices per triangle)
+        triangle_uvs (float32[m,6]): Array of triangle UV coordinates (three UV pairs per triangle)
+        triangle_materials (float32[m*3]): Array of material properties for triangles
+        triangle_material_types (int32[m]): Material type identifiers for triangles
+        texture_data (float32[k]): Flattened texture data
+        texture_dimensions (int32[l,2]): Dimensions of each texture
+        texture_indices (int32[n+m]): Indices to map objects to textures
+        out_color (float32[3]): Output color array
+        out_depth (float32[1]): Output depth value for temporal reprojection
+        rng_states: CUDA random number generator states
+        thread_id (int): Thread ID for random number generation
+        d_env_map (float32[height,width,3]): Environment map
+        d_env_cdf (float32[width*height]): Cumulative distribution function for env map
+        env_total (float): Total weight of environment map for importance sampling
+        env_width (int): Environment map width
+        env_height (int): Environment map height
+        bbox_min (float32[p,3]): BVH minimum bounding box coordinates
+        bbox_max (float32[p,3]): BVH maximum bounding box coordinates
+        left_indices (int32[p]): BVH left child indices
+        right_indices (int32[p]): BVH right child indices
+        is_leaf (int32[p]): BVH node type flags (1 for leaf, 0 for internal)
+        object_indices (int32[p]): BVH object indices for leaf nodes
+        num_nodes (int): Number of nodes in the BVH
     
-    This device function can replace the original trace_ray() in your CUDA kernel.
+    Returns:
+        Writes accumulated color to out_color and primary ray depth to out_depth
     """
     # Initialize registers (local arrays)
     current_origin = cuda.local.array(3, dtype=float32)
-    current_dir    = cuda.local.array(3, dtype=float32)
-    attenuation    = cuda.local.array(3, dtype=float32)
-    color_accum    = cuda.local.array(3, dtype=float32)
+    current_dir = cuda.local.array(3, dtype=float32)
+    attenuation = cuda.local.array(3, dtype=float32)
+    color_accum = cuda.local.array(3, dtype=float32)
     alive = 1  # flag to indicate that the ray is still active
+    primary_depth = float32(1e20)  # Initialize depth to a large value
 
     for i in range(3):
         current_origin[i] = origin[i]
-        current_dir[i]    = direction[i]
-        attenuation[i]    = 1.0
-        color_accum[i]    = 0.0
+        current_dir[i] = direction[i]
+        attenuation[i] = 1.0
+        color_accum[i] = 0.0
 
     # Pre-allocate temporary arrays (for UVs, hit point, normal, etc.)
-    uv_temp    = cuda.local.array(2, dtype=float32)
+    uv_temp = cuda.local.array(2, dtype=float32)
     tmp_hit_pt = cuda.local.array(3, dtype=float32)
     hit_normal = cuda.local.array(3, dtype=float32)
-    uv_coords  = cuda.local.array(2, dtype=float32)
+    uv_coords = cuda.local.array(2, dtype=float32)
     uv_coords[0] = 0.0
     uv_coords[1] = 0.0
 
@@ -318,34 +396,59 @@ def trace_ray(origin, direction, max_bounces,
         if alive == 0:
             break
 
-        # --- Intersection search (both spheres and triangles) ---
+        # --- Intersection search (with BVH if available) ---
         closest_t = float32(1e20)
-        hit_idx   = -1
+        hit_idx = -1
         hit_sphere = True
 
-        s_count = sphere_centers.shape[0]
-        for s_i in range(s_count):
-            tval = ray_sphere_intersect(current_origin, current_dir,
-                                        sphere_centers[s_i], sphere_radii[s_i],
-                                        float32(1e-4), closest_t)
-            if tval > 0.0:
-                closest_t = tval
-                hit_idx   = s_i
-                hit_sphere = True
+        # Use BVH traversal if available
+        if num_nodes > 0 and bbox_min is not None:
+            hit_obj, hit_t = gpu_bvh_traverse(
+                current_origin, current_dir,
+                bbox_min, bbox_max,
+                left_indices, right_indices,
+                is_leaf, object_indices, num_nodes,
+                float32(1e-4), closest_t,
+                sphere_centers, sphere_radii,
+                triangle_vertices, uv_temp
+            )
+            
+            if hit_obj >= 0:
+                closest_t = hit_t
+                hit_idx = hit_obj
+                # Determine if this is a sphere or triangle based on index range
+                s_count = sphere_centers.shape[0]
+                hit_sphere = hit_obj < s_count
+                if not hit_sphere:
+                    # Copy UV coordinates for triangle hit
+                    tri_idx = hit_obj - s_count
+                    uv_coords[0] = uv_temp[0]
+                    uv_coords[1] = uv_temp[1]
+        else:
+            # Fallback to brute force if BVH not available
+            s_count = sphere_centers.shape[0]
+            for s_i in range(s_count):
+                tval = ray_sphere_intersect(current_origin, current_dir,
+                                          sphere_centers[s_i], sphere_radii[s_i],
+                                          float32(1e-4), closest_t)
+                if tval > 0.0:
+                    closest_t = tval
+                    hit_idx = s_i
+                    hit_sphere = True
 
-        t_count = triangle_vertices.shape[0]
-        for t_i in range(t_count):
-            tval = ray_triangle_intersect(current_origin, current_dir,
-                                          triangle_vertices[t_i, 0:3],
-                                          triangle_vertices[t_i, 3:6],
-                                          triangle_vertices[t_i, 6:9],
-                                          float32(1e-4), closest_t, uv_temp)
-            if tval > 0.0:
-                closest_t = tval
-                hit_idx   = t_i
-                hit_sphere = False
-                uv_coords[0] = uv_temp[0]
-                uv_coords[1] = uv_temp[1]
+            t_count = triangle_vertices.shape[0]
+            for t_i in range(t_count):
+                tval = ray_triangle_intersect(current_origin, current_dir,
+                                            triangle_vertices[t_i, 0:3],
+                                            triangle_vertices[t_i, 3:6],
+                                            triangle_vertices[t_i, 6:9],
+                                            float32(1e-4), closest_t, uv_temp)
+                if tval > 0.0:
+                    closest_t = tval
+                    hit_idx = t_i
+                    hit_sphere = False
+                    uv_coords[0] = uv_temp[0]
+                    uv_coords[1] = uv_temp[1]
 
         # --- If no intersection found, sample the environment ---
         if hit_idx < 0:
@@ -356,12 +459,18 @@ def trace_ray(origin, direction, max_bounces,
             alive = 0  # mark the ray as terminated
             continue  # continue to end of loop (without further processing)
 
+        # --- Store depth for the primary ray (first bounce only) ---
+        if bounce == 0:
+            primary_depth = closest_t
+
         # --- Compute hit point ---
         for i in range(3):
             tmp_hit_pt[i] = current_origin[i] + closest_t * current_dir[i]
 
         # --- Material handling and normal calculation ---
         mat_color = cuda.local.array(3, dtype=float32)
+        roughness = float32(0.1)  # Default roughness for microfacet materials
+        
         for i in range(3):
             mat_color[i] = 0.0
 
@@ -370,7 +479,7 @@ def trace_ray(origin, direction, max_bounces,
             radius = sphere_radii[hit_idx]
             for i in range(3):
                 hit_normal[i] = (tmp_hit_pt[i] - center[i]) / radius
-            # Flip the normal using a branch–reduced approach:
+            # Flip the normal using a branch-reduced approach:
             ndot = dot(current_dir, hit_normal)
             if ndot > 0.0:
                 for i in range(3):
@@ -379,9 +488,13 @@ def trace_ray(origin, direction, max_bounces,
             base_idx = hit_idx * 3
             for i in range(3):
                 mat_color[i] = sphere_materials[base_idx + i]
+            # For microfacet materials, get roughness from material properties
+            if mat_type == 4:  # MicrofacetMetal
+                roughness = sphere_materials[base_idx + 3] if base_idx + 3 < sphere_materials.shape[0] else 0.1
             # Compute sphere UV coordinates (if needed for texturing)
             calculate_sphere_uv(tmp_hit_pt, center, uv_coords)
         else:
+            # It's a triangle
             compute_triangle_normal(triangle_vertices[hit_idx], hit_normal)
             if dot(current_dir, hit_normal) > 0.0:
                 for i in range(3):
@@ -390,6 +503,9 @@ def trace_ray(origin, direction, max_bounces,
             base_idx = hit_idx * 3
             for i in range(3):
                 mat_color[i] = triangle_materials[base_idx + i]
+            # For microfacet materials, get roughness from material properties
+            if mat_type == 4:  # MicrofacetMetal
+                roughness = triangle_materials[base_idx + 3] if base_idx + 3 < triangle_materials.shape[0] else 0.1
 
         normalize_inplace(hit_normal)
 
@@ -435,7 +551,7 @@ def trace_ray(origin, direction, max_bounces,
 
         # --- BSDF sampling for the next bounce ---
         scatter_dir = cuda.local.array(3, dtype=float32)
-        valid_scatter = bsdf_sample(mat_type, current_dir, hit_normal, mat_color, ior_val,
+        valid_scatter = bsdf_sample(mat_type, current_dir, hit_normal, mat_color, ior_val, roughness,
                                     rng_states, thread_id, scatter_dir)
         if not valid_scatter:
             alive = 0
@@ -462,7 +578,7 @@ def trace_ray(origin, direction, max_bounces,
         # Update ray for the next bounce
         for i in range(3):
             current_origin[i] = tmp_hit_pt[i]
-            current_dir[i]    = scatter_dir[i]
+            current_dir[i] = scatter_dir[i]
 
         # --- Russian Roulette (applied uniformly) ---
         if bounce >= 3:
@@ -475,7 +591,9 @@ def trace_ray(origin, direction, max_bounces,
                 for i in range(3):
                     attenuation[i] *= invp
 
-    # Write the final accumulated color
+    # Write the final accumulated color and depth
     for i in range(3):
         out_color[i] = color_accum[i]
+    
+    out_depth[0] = primary_depth
 

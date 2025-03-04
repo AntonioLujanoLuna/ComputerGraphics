@@ -262,10 +262,10 @@ class Application:
         except Exception as e:
             print(f"Error loading model: {str(e)}")
         
-        # Gold sphere
+        # Gold microfacet sphere
         world.add(Sphere(
             Vector3(2, 1, 0), 1.0,
-            MetalPresets.gold()
+            MetalPresets.microfacet_gold()  # Use microfacet gold instead
         ))
         
         # Glass sphere

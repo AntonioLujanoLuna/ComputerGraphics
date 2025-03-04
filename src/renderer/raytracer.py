@@ -6,6 +6,7 @@ import math
 from materials.metal import Metal
 from materials.dielectric import Dielectric
 from materials.textures import Texture
+from materials.microfacet_metal import MicrofacetMetal
 from .cuda_kernels import adaptive_render_kernel, compute_variance_mask_kernel
 from renderer.cuda_temporal import temporal_reprojection_kernel
 from renderer.env_importance import build_env_cdf
@@ -178,6 +179,11 @@ class Renderer:
                 elif isinstance(mat, Dielectric):
                     sphere_materials[mat_idx:mat_idx+3] = [mat.ref_idx, 0.0, 0.0]
                     sphere_material_types[sphere_idx] = 3  # Dielectric
+                elif isinstance(mat, MicrofacetMetal):
+                    sphere_materials[mat_idx:mat_idx+3] = [mat.albedo.x, mat.albedo.y, mat.albedo.z]
+                    # Store roughness in a separate parameter or in the 4th component
+                    sphere_roughness[sphere_idx] = mat.roughness
+                    sphere_material_types[sphere_idx] = 4  # MicrofacetMetal
                 else:
                     if hasattr(mat, 'texture') and mat.texture is not None:
                         if hasattr(mat.texture, 'color'):
@@ -264,7 +270,24 @@ class Renderer:
             self.d_bvh_object_indices = None
 
     def render_frame_adaptive(self, camera, world) -> np.ndarray:
-        # Set up current camera parameters.
+        """
+        Render a frame with adaptive sampling, BVH acceleration, and temporal reprojection.
+        
+        This method:
+        1. Prepares camera and scene parameters for GPU rendering
+        2. Performs temporal reprojection to reuse data from previous frames
+        3. Launches the adaptive rendering kernel with BVH acceleration
+        4. Computes a convergence mask to focus computation on noisy areas
+        5. Updates history buffers for the next frame
+        
+        Parameters:
+            camera: Camera object with position, orientation, and projection parameters
+            world: Scene containing objects to render
+            
+        Returns:
+            np.ndarray: Rendered image of shape (width, height, 3) with float32 values
+        """
+        # Set up current camera parameters
         camera_origin = np.array(
             [camera.position.x, camera.position.y, camera.position.z],
             dtype=np.float32
@@ -281,7 +304,6 @@ class Renderer:
             [camera.vertical.x, camera.vertical.y, camera.vertical.z],
             dtype=np.float32
         )
-        # These extra vectors are assumed to be computed by your camera.
         camera_forward = np.array(
             [camera.forward.x, camera.forward.y, camera.forward.z],
             dtype=np.float32
@@ -296,7 +318,10 @@ class Renderer:
         )
         curr_focus = camera.focus_dist
 
+        # Create CUDA stream for asynchronous operations
         stream = cuda.stream()
+        
+        # Transfer camera parameters to device
         d_camera_origin = cuda.to_device(camera_origin, stream=stream)
         d_camera_lower_left = cuda.to_device(camera_lower_left, stream=stream)
         d_camera_horizontal = cuda.to_device(camera_horizontal, stream=stream)
@@ -306,17 +331,20 @@ class Renderer:
         d_camera_up = cuda.to_device(camera_up, stream=stream)
         d_curr_focus = cuda.to_device(np.array([curr_focus], dtype=np.float32), stream=stream)
 
-        # Ensure that d_prev_depth is allocated (it might be None on the very first frame).
+        # Ensure depth buffer is allocated
         if self.d_prev_depth is None:
             host_depth = np.zeros((self.width, self.height), dtype=np.float32)
             self.d_prev_depth = cuda.to_device(host_depth, stream=stream)
 
-        # Allocate a pinned host output array.
+        # Allocate current frame's depth buffer
+        d_depth_buffer = cuda.to_device(np.zeros((self.width, self.height), dtype=np.float32), stream=stream)
+
+        # Allocate output image buffer
         frame_output = cuda.pinned_array((self.width, self.height, 3), dtype=np.float32)
         d_frame_output = cuda.to_device(frame_output, stream=stream)
 
         # --- Temporal Reprojection Step ---
-        # If we have a previous frame (frame_number > 0) and stored camera parameters, reproject.
+        # If we have a previous frame and camera parameters, reproject data
         if self.frame_number > 0 and self.prev_camera_origin is not None:
             d_prev_cam_origin = cuda.to_device(self.prev_camera_origin, stream=stream)
             d_prev_cam_lower_left = cuda.to_device(self.prev_camera_lower_left, stream=stream)
@@ -327,10 +355,11 @@ class Renderer:
             d_prev_cam_up = cuda.to_device(self.prev_camera_up, stream=stream)
             d_prev_focus = cuda.to_device(np.array([self.prev_focus], dtype=np.float32), stream=stream)
 
-            # Allocate temporary buffers for the new (blended) accumulation and sample count.
+            # Allocate temporary buffers for the blended accumulation and sample count
             temp_accum = cuda.to_device(np.zeros((self.width, self.height, 3), dtype=np.float32), stream=stream)
             temp_sample_count = cuda.to_device(np.zeros((self.width, self.height), dtype=np.int32), stream=stream)
 
+            # Launch temporal reprojection kernel
             temporal_reprojection_kernel[self.blockspergrid, self.threadsperblock, stream](
                 self.width, self.height,
                 self.d_prev_accum, self.d_prev_sample_count, self.d_prev_depth,
@@ -341,27 +370,58 @@ class Renderer:
                 temp_accum, temp_sample_count
             )
             stream.synchronize()
-            # Replace the current accumulation buffers with the reprojected ones.
+            
+            # Replace current accumulation buffers with reprojected ones
             self.d_accum_buffer = temp_accum
             self.d_sample_count = temp_sample_count
+
+        # --- Determine BVH parameters ---
+        # Get BVH node count if available
+        num_nodes = 0
+        if hasattr(self, 'd_bvh_bbox_min') and self.d_bvh_bbox_min is not None:
+            num_nodes = self.d_bvh_bbox_min.shape[0]
 
         # --- Launch Adaptive Render Kernel ---
         adaptive_render_kernel[self.blockspergrid, self.threadsperblock, stream](
             self.width, self.height,
             d_camera_origin, d_camera_lower_left,
             d_camera_horizontal, d_camera_vertical,
-            self.d_sphere_centers, self.d_sphere_radii, self.d_sphere_materials, self.d_sphere_material_types,
-            self.d_triangle_vertices, self.d_triangle_uvs, self.d_triangle_materials, self.d_triangle_material_types,
+            self.d_sphere_centers, self.d_sphere_radii, 
+            self.d_sphere_materials, self.d_sphere_material_types,
+            self.d_triangle_vertices, self.d_triangle_uvs, 
+            self.d_triangle_materials, self.d_triangle_material_types,
             self.d_texture_data, self.texture_dimensions, self.d_texture_indices,
-            self.d_accum_buffer, self.d_accum_buffer_sq, self.d_sample_count,
-            self.d_mask, d_frame_output, self.frame_number, self.rng_states, self.N,
+            self.d_accum_buffer, self.d_accum_buffer_sq, 
+            self.d_sample_count, self.d_mask, d_frame_output, d_depth_buffer,
+            self.frame_number, self.rng_states, self.N,
             self.d_env_map, self.d_env_cdf, self.env_total, self.env_width, self.env_height,
-            self.d_halton_table_base2, self.d_halton_table_base3, self.d_halton_table_base5
+            self.d_halton_table_base2, self.d_halton_table_base3, self.d_halton_table_base5,
+            self.d_bvh_bbox_min if num_nodes > 0 else None,
+            self.d_bvh_bbox_max if num_nodes > 0 else None,
+            self.d_bvh_left if num_nodes > 0 else None,
+            self.d_bvh_right if num_nodes > 0 else None,
+            self.d_bvh_is_leaf if num_nodes > 0 else None,
+            self.d_bvh_object_indices if num_nodes > 0 else None,
+            num_nodes
         )
+        
+        # --- Update Convergence Mask ---
+        # Every 8 frames, update which pixels have converged
+        if self.frame_number % 8 == 0:
+            compute_variance_mask_kernel[self.blockspergrid, self.threadsperblock, stream](
+                self.d_accum_buffer, self.d_accum_buffer_sq, 
+                self.d_sample_count, self.d_mask, 
+                0.001,  # Variance threshold
+                32      # Minimum samples before considering convergence
+            )
+        
         stream.synchronize()
 
+        # Copy the result to host memory
         frame_output = d_frame_output.copy_to_host(stream=stream)
         stream.synchronize()
+        
+        # Increment frame counter
         self.frame_number += 1
 
         # --- Update Previous Frame Data for Next Reprojection ---
@@ -374,10 +434,10 @@ class Renderer:
         self.prev_camera_up = camera_up.copy()
         self.prev_focus = curr_focus
 
-        # For simplicity, we use the current accumulation and sample count buffers as the history.
+        # Store current state for next frame's temporal reprojection
         self.d_prev_accum = self.d_accum_buffer
         self.d_prev_sample_count = self.d_sample_count
-        # NOTE: You should update self.d_prev_depth from your ray-tracing kernel's depth output.
+        self.d_prev_depth = d_depth_buffer
 
         return frame_output
 

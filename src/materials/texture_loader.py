@@ -49,10 +49,3 @@ def create_image_material(image_path: str, material_class, **material_params):
     """
     texture = load_texture(image_path)
     return material_class(texture, **material_params)
-
-# Add to TexturePresets
-class TexturePresets:
-    @staticmethod
-    def from_image(image_path: str) -> ImageTexture:
-        """Create a texture from an image file."""
-        return load_texture(image_path)

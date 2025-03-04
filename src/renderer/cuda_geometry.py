@@ -160,20 +160,68 @@ def gpu_bvh_traverse(ray_origin, ray_dir,
     while stack_ptr > 0:
         stack_ptr -= 1
         node_idx = stack[stack_ptr]
+        
+        # Skip if box doesn't intersect
         if not aabb_hit(ray_origin, ray_dir, bbox_min[node_idx], bbox_max[node_idx], t_min, hit_t):
             continue
+            
         if is_leaf[node_idx] == 1:
-            # Here you would call your object-specific intersection function.
-            # For illustration we assume that a hit is recorded by updating hit_t and hit_object.
-            # (This is a placeholder; you must replace it with your actual object intersection.)
-            t = t_min * 0.99  # placeholder value
-            if t < hit_t:
-                hit_t = t
-                hit_object = object_indices[node_idx]
+            # For leaf nodes, get the object index and check the specific primitive type
+            obj_idx = object_indices[node_idx]
+            if obj_idx >= 0:  # Valid object
+                sphere_count = sphere_centers.shape[0]  # This should be passed as a parameter
+                
+                if obj_idx < sphere_count:
+                    # It's a sphere
+                    t = ray_sphere_intersect(ray_origin, ray_dir, 
+                                            sphere_centers[obj_idx], 
+                                            sphere_radii[obj_idx],
+                                            t_min, hit_t)
+                    if t > 0.0 and t < hit_t:
+                        hit_t = t
+                        hit_object = obj_idx
+                else:
+                    # It's a triangle
+                    tri_idx = obj_idx - sphere_count
+                    uv = cuda.local.array(2, dtype=float32)
+                    t = ray_triangle_intersect(ray_origin, ray_dir,
+                                              triangle_vertices[tri_idx, 0:3],
+                                              triangle_vertices[tri_idx, 3:6],
+                                              triangle_vertices[tri_idx, 6:9],
+                                              t_min, hit_t, uv)
+                    if t > 0.0 and t < hit_t:
+                        hit_t = t
+                        hit_object = obj_idx
         else:
-            stack[stack_ptr] = left_indices[node_idx]
-            stack_ptr += 1
-            stack[stack_ptr] = right_indices[node_idx]
-            stack_ptr += 1
+            # For internal nodes, push both children onto the stack
+            left_idx = left_indices[node_idx]
+            right_idx = right_indices[node_idx]
+            
+            # Push first the node that's further from the origin
+            # (optimization: traverse nearer nodes first)
+            left_center = cuda.local.array(3, dtype=float32)
+            right_center = cuda.local.array(3, dtype=float32)
+            
+            for i in range(3):
+                left_center[i] = (bbox_min[left_idx][i] + bbox_max[left_idx][i]) * 0.5
+                right_center[i] = (bbox_min[right_idx][i] + bbox_max[right_idx][i]) * 0.5
+            
+            left_dist = 0.0
+            right_dist = 0.0
+            for i in range(3):
+                left_dist += (left_center[i] - ray_origin[i]) * (left_center[i] - ray_origin[i])
+                right_dist += (right_center[i] - ray_origin[i]) * (right_center[i] - ray_origin[i])
+            
+            if left_dist > right_dist:
+                stack[stack_ptr] = left_idx
+                stack_ptr += 1
+                stack[stack_ptr] = right_idx
+                stack_ptr += 1
+            else:
+                stack[stack_ptr] = right_idx
+                stack_ptr += 1
+                stack[stack_ptr] = left_idx
+                stack_ptr += 1
+                
     return hit_object, hit_t
 

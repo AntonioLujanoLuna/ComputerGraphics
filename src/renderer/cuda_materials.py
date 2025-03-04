@@ -131,6 +131,58 @@ def scatter_dielectric(current_dir, normal, ior, rng_states, thread_id, out_scat
     return True
 
 @cuda.jit(device=True)
+def scatter_microfacet_metal(incident, normal, albedo, roughness, rng_states, thread_id, out_scattered):
+    """Compute microfacet metal scattering."""
+    # Compute a half-vector via importance-sampling
+    half_vector = cuda.local.array(3, dtype=float32)
+    
+    # Sample a direction with GGX distribution
+    # Simplified implementation - can be improved with true GGX sampling
+    a2 = roughness * roughness
+    
+    # Importance sample based on roughness
+    phi = 2.0 * math.pi * xoroshiro128p_uniform_float32(rng_states, thread_id)
+    cos_theta = math.sqrt((1.0 - xoroshiro128p_uniform_float32(rng_states, thread_id)) / 
+                         (1.0 + (a2 - 1.0) * xoroshiro128p_uniform_float32(rng_states, thread_id)))
+    sin_theta = math.sqrt(1.0 - cos_theta * cos_theta)
+    
+    # Compute local coords
+    x = sin_theta * math.cos(phi)
+    y = sin_theta * math.sin(phi)
+    z = cos_theta
+    
+    # Transform to world space (simplistic version)
+    # First create an arbitrary tangent
+    tangent = cuda.local.array(3, dtype=float32)
+    bitangent = cuda.local.array(3, dtype=float32)
+    
+    if abs(normal[0]) > 0.1:
+        tangent[0] = normal[1]
+        tangent[1] = -normal[0]
+        tangent[2] = 0.0
+    else:
+        tangent[0] = 0.0
+        tangent[1] = normal[2]
+        tangent[2] = -normal[1]
+    
+    normalize_inplace(tangent)
+    cross_inplace(bitangent, normal, tangent)
+    
+    for i in range(3):
+        half_vector[i] = x * tangent[i] + y * bitangent[i] + z * normal[i]
+    
+    normalize_inplace(half_vector)
+    
+    # Reflect incident ray around half vector
+    dot_i_h = dot(incident, half_vector)
+    for i in range(3):
+        out_scattered[i] = incident[i] - 2.0 * dot_i_h * half_vector[i]
+        
+    normalize_inplace(out_scattered)
+    
+    return dot(out_scattered, normal) > 0
+
+@cuda.jit(device=True)
 def sample_environment(direction, out_color):
     """
     Sample environment map (simple gradient sky)

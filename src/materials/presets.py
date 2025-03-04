@@ -4,7 +4,8 @@ from materials.metal import Metal
 from materials.lambertian import Lambertian
 from materials.dielectric import Dielectric
 from materials.diffuse_light import DiffuseLight
-from materials.textures import CheckerTexture, MarbleTexture
+from materials.textures import CheckerTexture, MarbleTexture, ImageTexture
+from materials.microfacet_metal import MicrofacetMetal
 
 class MetalPresets:
     """Predefined metal materials with realistic properties."""
@@ -32,6 +33,18 @@ class MetalPresets:
     @staticmethod
     def brushed_metal() -> Metal:
         return Metal(Vector3(0.8, 0.8, 0.8), fuzz=0.3)
+
+    @staticmethod
+    def microfacet_gold() -> MicrofacetMetal:
+        return MicrofacetMetal(Vector3(1.0, 0.78, 0.34), roughness=0.1)
+
+    @staticmethod
+    def microfacet_silver() -> MicrofacetMetal:
+        return MicrofacetMetal(Vector3(0.95, 0.93, 0.88), roughness=0.05)
+
+    @staticmethod
+    def microfacet_copper() -> MicrofacetMetal:
+        return MicrofacetMetal(Vector3(0.95, 0.64, 0.54), roughness=0.1)
 
 class DielectricPresets:
     """Predefined dielectric materials with realistic refractive indices."""
@@ -114,3 +127,9 @@ class TexturePresets:
     def marble(scale: float = 5.0, turbulence: float = 5.0) -> MarbleTexture:
         """Create a marble texture with the given scale and turbulence."""
         return MarbleTexture(scale, turbulence)
+
+    @staticmethod
+    def from_image(image_path: str) -> ImageTexture:
+        """Create a texture from an image file."""
+        from materials.texture_loader import load_texture  # Import here to avoid circular imports
+        return load_texture(image_path)
