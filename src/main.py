@@ -55,9 +55,9 @@ class Application:
         # Initialize camera with depth of field
         self.aspect_ratio = self.window_width / self.window_height
         self.camera = Camera(
-            position=Vector3(0, 2, 10),
+            position=Vector3(0, 2, 6),
             yaw=0.0,
-            pitch=-0.2,
+            pitch=-0.0,
             fov=math.radians(50),  # Slightly narrower FOV
             aspect_ratio=self.aspect_ratio,
             aperture=0.01,  # Small aperture for subtle depth of field
